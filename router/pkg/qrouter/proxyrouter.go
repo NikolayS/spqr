@@ -1,6 +1,8 @@
 package qrouter
 
 import (
+	"math/rand"
+
 	"github.com/blastrain/vitess-sqlparser/sqlparser"
 	"github.com/pg-sharding/spqr/pkg/config"
 	"github.com/pg-sharding/spqr/pkg/models/kr"
@@ -18,9 +20,44 @@ type ProxyRouter struct {
 
 	Ranges map[string]kr.KeyRange
 
-	ShardCfgs map[string]*config.ShardCfg
+	ShardCfgs      map[string]*config.ShardCfg
+	WorldShardCfgs map[string]*config.ShardCfg
 
 	qdb qdb.QrouterDB
+}
+
+func (qr *ProxyRouter) AddWorldShard(name string, cfg *config.ShardCfg) error {
+
+	tracelog.InfoLogger.Printf("adding world shard %s", name)
+	qr.WorldShardCfgs[name] = cfg
+
+	return nil
+}
+
+func (qr *ProxyRouter) WorldShardsRoutes() []ShardRoute {
+
+	var ret []ShardRoute
+
+	for name := range qr.WorldShardCfgs {
+		ret = append(ret, ShardRoute{
+			Shkey: kr.ShardKey{
+				Name: name,
+				RW:   true,
+			},
+		})
+	}
+
+	// a sort of round robin
+
+	rand.Shuffle(len(ret), func(i, j int) {
+		ret[i], ret[j] = ret[j], ret[i]
+	})
+	return ret
+}
+
+func (qr *ProxyRouter) WorldShards() []string {
+
+	panic("implement me")
 }
 
 var _ Qrouter = &ProxyRouter{}
@@ -32,11 +69,12 @@ func NewProxyRouter() (*ProxyRouter, error) {
 	}
 
 	return &ProxyRouter{
-		ColumnMapping: map[string]struct{}{},
-		LocalTables:   map[string]struct{}{},
-		Ranges:        map[string]kr.KeyRange{},
-		ShardCfgs:     map[string]*config.ShardCfg{},
-		qdb:           db,
+		ColumnMapping:  map[string]struct{}{},
+		LocalTables:    map[string]struct{}{},
+		Ranges:         map[string]kr.KeyRange{},
+		ShardCfgs:      map[string]*config.ShardCfg{},
+		WorldShardCfgs: map[string]*config.ShardCfg{},
+		qdb:            db,
 	}, nil
 }
 
@@ -96,7 +134,7 @@ func (qr *ProxyRouter) UnLock(krid string) error {
 	return qr.qdb.UnLock(keyRange.ToSQL())
 }
 
-func (qr *ProxyRouter) AddShard(name string, cfg *config.ShardCfg) error {
+func (qr *ProxyRouter) AddDataShard(name string, cfg *config.ShardCfg) error {
 
 	tracelog.InfoLogger.Printf("adding node %s", name)
 	qr.ShardCfgs[name] = cfg

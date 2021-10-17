@@ -5,6 +5,8 @@ go 1.17
 require (
 	github.com/blastrain/vitess-sqlparser v0.0.0-20201030050434-a139afbb1aba
 	github.com/jackc/pgproto3 v1.1.0
+	github.com/jmoiron/sqlx v1.3.4
+	github.com/lib/pq v1.10.3
 	github.com/libp2p/go-reuseport v0.1.0
 	github.com/opentracing/opentracing-go v1.2.0
 	github.com/pkg/errors v0.9.1
@@ -36,7 +38,7 @@ require (
 	go.uber.org/atomic v1.7.0 // indirect
 	go.uber.org/multierr v1.6.0 // indirect
 	go.uber.org/zap v1.17.0 // indirect
-	golang.org/x/net v0.0.0-20211014172544-2b766c08f1c0 // indirect
+	golang.org/x/net v0.0.0-20211014222326-fd004c51d1d6 // indirect
 	golang.org/x/sys v0.0.0-20211013075003-97ac67df715c // indirect
 	golang.org/x/text v0.3.7 // indirect
 	google.golang.org/genproto v0.0.0-20211013025323-ce878158c4d4 // indirect

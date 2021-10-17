@@ -1,4 +1,4 @@
-package main
+package worldmock
 
 import (
 	"context"
@@ -13,17 +13,19 @@ import (
 )
 
 type WorldMock struct {
+	addr string
 }
 
-func (w *WorldMock) Run() {
+func (w *WorldMock) Run() error {
 
 	ctx := context.Background()
 
-	proto, addr := "tcp", "localhost:6432"
+	proto := "tcp"
 
-	listener, err := reuse.Listen(proto, addr)
+	listener, err := reuse.Listen(proto, w.addr)
 	if err != nil {
-		tracelog.ErrorLogger.FatalError(err)
+		tracelog.ErrorLogger.PrintError(err)
+		return err
 	}
 	defer listener.Close()
 
@@ -94,7 +96,7 @@ func (w *WorldMock) serv(conn net.Conn) error {
 
 			tracelog.InfoLogger.Printf("received message %v", v.String)
 
-			_ = cl.ReplyNotice("you are receiving messagwe from mock world shard")
+			_ = cl.ReplyNotice("you are receiving message from mock world shard")
 
 			err := func() error {
 				for _, msg := range []pgproto3.BackendMessage{
@@ -128,9 +130,10 @@ func (w *WorldMock) serv(conn net.Conn) error {
 		default:
 		}
 	}
-
 }
 
-func NewWorldMock() *WorldMock {
-	return &WorldMock{}
+func NewWorldMock(addr string) *WorldMock {
+	return &WorldMock{
+		addr: addr,
+	}
 }

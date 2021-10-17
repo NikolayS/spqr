@@ -13,6 +13,19 @@ type ShardQrouter struct {
 	shid string
 }
 
+func (l *ShardQrouter) AddWorldShard(name string, cfg *config.ShardCfg) error {
+	panic("implement me")
+}
+
+func (l *ShardQrouter) WorldShardsRoutes() []ShardRoute {
+	panic("implement me")
+}
+
+func (l *ShardQrouter) WorldShards() []string {
+
+	panic("implement me")
+}
+
 var _ Qrouter = &ShardQrouter{}
 
 func NewShardQrouter(shid string) (*ShardQrouter, error) {
@@ -45,7 +58,7 @@ func (l *ShardQrouter) KeyRanges() []kr.KeyRange {
 	return nil
 }
 
-func (l *ShardQrouter) AddShard(name string, cfg *config.ShardCfg) error {
+func (l *ShardQrouter) AddDataShard(name string, cfg *config.ShardCfg) error {
 	return errors.New("local qrouter does not support sharding")
 }
 
