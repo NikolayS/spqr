@@ -1,34 +1,92 @@
 package client
 
 import (
+	"context"
 	"crypto/tls"
+	"net"
 
-	"github.com/jackc/pgproto3"
+	"github.com/jackc/pgx/v5/pgproto3"
+	"github.com/pg-sharding/spqr/pkg/errcounter"
+	"github.com/pg-sharding/spqr/pkg/session"
+	"github.com/pg-sharding/spqr/pkg/shard"
+	"github.com/pg-sharding/spqr/pkg/txstatus"
+	"github.com/pg-sharding/spqr/router/statistics"
 )
 
-type Client interface {
-	ID() string
+type ParamManager interface {
+	SetParam(string, string, bool)
+	ResetParam(string)
+	ResetAll()
+	ConstructClientParams() *pgproto3.Query
+	Params() map[string]string
 
-	ReplyErr(errmsg string) error
-	ReplyNotice(msg string) error
+	StartTx()
+	CommitActiveSet()
+	CleanupStatementSet()
+	Savepoint(string)
+	Rollback()
+	RollbackToSP(string)
+}
+
+type Client interface {
+	ParamManager
+	session.SessionParamsHolder
+	statistics.StatHolder
+
+	ID() uint
+
+	ReplyErrMsg(e string, c string, p int32, s txstatus.TXStatus) error
+	ReplyErrWithTxStatus(e error, s txstatus.TXStatus) error
+	ReplyErrMsgByCode(code string) error
+	ReplyErr(errmsg error) error
+	ReplyRFQ(txstatus txstatus.TXStatus) error
+	ReplyNotice(message string) error
+	ReplyDebugNotice(msg string) error
+	ReplyDebugNoticef(fmt string, args ...any) error
+
+	ReplyWarningMsg(code string, msg string) error
+	ReplyWarningf(code string, fmt string, args ...any) error
 	DefaultReply() error
 
-	Init(cfg *tls.Config, reqssl string) error
+	Init(cfg *tls.Config) error
 
-	Auth() error
-
-	PasswordCT() string
-	PasswordMD5() string
+	/* password clear text */
+	PasswordCT() (string, error)
+	PasswordMD5(salt [4]byte) (string, error)
 
 	StartupMessage() *pgproto3.StartupMessage
 
 	Usr() string
+	/* XXX: also maybe ROLE support is meaningful? */
 	DB() string
 
 	Send(msg pgproto3.BackendMessage) error
 	Receive() (pgproto3.FrontendMessage, error)
-	ProcQuery(query *pgproto3.Query) (byte, error)
 
 	Shutdown() error
 	Reset() error
+	Close() error
+
+	Shards() []shard.ShardHostInstance
+	Cancel() error
+	/* Returns list of resource (connection) IDs, associated with this client */
+	CancellableIDs() []uint32
+	CancelPID() uint32
+	CancelMsg() *pgproto3.CancelRequest
+
+	Reply(msg string) error
+
+	Conn() net.Conn
+
+	SetAuthType(uint32) error
+
+	SetErrCounter(errcounter.ErrCounter)
+
+	// [icp.ICPContextHolder] support functions
+	Wait()
+	Wake()
+}
+
+type InteractRunner interface {
+	ProcClient(ctx context.Context, conn net.Conn) error
 }

@@ -1,7 +1,4 @@
-FROM golang:1.17
+FROM golang:latest
 
-RUN mkdir /router
-COPY ./ /router
-
-RUN cd /router && make && make build
-
+COPY ./ /spqr
+RUN cd /spqr && make && make build GIT_REVISION=devel SPQR_VERSION=devel GIT_COMMIT_COUNT=0

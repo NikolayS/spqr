@@ -3,16 +3,19 @@ package conn
 import (
 	"crypto/tls"
 	"encoding/binary"
+	"fmt"
 	"net"
+	"os"
+	"syscall"
+	"time"
 
-	"github.com/jackc/pgproto3"
-	"github.com/pg-sharding/spqr/pkg/config"
-	"github.com/wal-g/tracelog"
-	"golang.org/x/xerrors"
+	"github.com/jackc/pgx/v5/pgproto3"
+	"github.com/pg-sharding/spqr/pkg/spqrlog"
 )
 
-const SSLREQ = 80877103
 const CANCELREQ = 80877102
+const SSLREQ = 80877103
+const GSSREQ = 80877104
 
 type InstanceStatus string
 
@@ -23,124 +26,277 @@ type DBInstance interface {
 	Send(query pgproto3.FrontendMessage) error
 	Receive() (pgproto3.BackendMessage, error)
 
-	CheckRW() (bool, error)
-	ReqBackendSsl(tlscfg *tls.Config) error
+	ReqBackendSsl(*tls.Config) error
+
+	Conn() net.Conn
 
 	Hostname() string
+	AvailabilityZone() string
+	ShardName() string
 
 	Close() error
 	Status() InstanceStatus
 	SetStatus(status InstanceStatus)
+
+	Cancel(csm *pgproto3.CancelRequest) error
+
+	Tls() *tls.Config
 }
 
 type PostgreSQLInstance struct {
 	conn     net.Conn
 	frontend *pgproto3.Frontend
 
-	hostname string
-	status   InstanceStatus
+	hostname  string
+	az        string // availability zone
+	shardname string
+	status    InstanceStatus
+
+	tlsconfig *tls.Config
 }
 
+// SetStatus sets the status of the PostgreSQLInstance.
+//
+// Parameters:
+// - status (InstanceStatus): a new status of the instance.
+//
+// Returns:
+// - None.
 func (pgi *PostgreSQLInstance) SetStatus(status InstanceStatus) {
 	pgi.status = status
 }
 
+// SetShardName sets the shard name of the PostgreSQLInstance.
+//
+// Parameters:
+// - name (string): the name of the shard to be set.
+//
+// Returns:
+// - None.
+func (pgi *PostgreSQLInstance) SetShardName(name string) {
+	pgi.shardname = name
+}
+
+// SetFrontend sets the frontend of the PostgreSQLInstance.
+//
+// Parameters:
+// - f (*pgproto3.Frontend): the frontend to be set.
+//
+// Returns:
+// - None.
+func (pgi *PostgreSQLInstance) SetFrontend(f *pgproto3.Frontend) {
+	pgi.frontend = f
+}
+
+// Status returns the status of the PostgreSQLInstance.
+//
+// Parameters:
+// - None.
+//
+// Returns:
+// - InstanceStatus.
 func (pgi *PostgreSQLInstance) Status() InstanceStatus {
 	return pgi.status
 }
 
+// Close closes the connection of the PostgreSQLInstance.
+// It returns an error if there was a problem closing the connection.
+//
+// Parameters:
+// - None.
+//
+// Returns:
+// - error: An error if there was a problem closing the connection.
 func (pgi *PostgreSQLInstance) Close() error {
 	return pgi.conn.Close()
 }
 
+// Hostname returns the hostname of the PostgreSQLInstance.
+//
+// Parameters:
+// - None.
+//
+// Returns:
+// - string: The hostname of the PostgreSQLInstance.
 func (pgi *PostgreSQLInstance) Hostname() string {
 	return pgi.hostname
 }
 
-func (pgi *PostgreSQLInstance) Send(query pgproto3.FrontendMessage) error {
-	return pgi.frontend.Send(query)
+// AvailabilityZone returns the availability zone of the PostgreSQLInstance.
+//
+// Parameters:
+// - None.
+//
+// Returns:
+// - string: The availability zone of the PostgreSQLInstance.
+func (pgi *PostgreSQLInstance) AvailabilityZone() string {
+	return pgi.az
 }
 
+// ShardName returns the shard name of the PostgreSQLInstance.
+//
+// Parameters:
+// - None.
+//
+// Returns:
+// - string: The shard name of the PostgreSQLInstance.
+func (pgi *PostgreSQLInstance) ShardName() string {
+	return pgi.shardname
+}
+
+// Send sends a query using the PostgreSQLInstance's frontend and flushes the connection.
+//
+// Parameters:
+// - query (pgproto3.FrontendMessage): The query to send.
+//
+// Return:
+// - error: An error if the sending or flushing fails.
+func (pgi *PostgreSQLInstance) Send(query pgproto3.FrontendMessage) error {
+	pgi.frontend.Send(query)
+
+	switch query.(type) {
+	case
+		*pgproto3.Sync,
+		*pgproto3.Query,
+		*pgproto3.StartupMessage,
+		*pgproto3.PasswordMessage,
+		*pgproto3.SASLResponse, *pgproto3.SASLInitialResponse,
+		*pgproto3.GSSResponse, *pgproto3.GSSEncRequest,
+		*pgproto3.CopyDone, *pgproto3.CopyData, *pgproto3.CopyFail:
+		return pgi.frontend.Flush()
+	default:
+		return nil
+	}
+}
+
+// Receive returns a backend message received using the PostgreSQLInstance's frontend.
+//
+// Parameters:
+// - None.
+//
+// Return:
+// - pgproto3.BackendMessage: The received backend message.
+// - error: An error if the receiving fails.
 func (pgi *PostgreSQLInstance) Receive() (pgproto3.BackendMessage, error) {
 	return pgi.frontend.Receive()
 }
 
-const defaultProto = "tcp"
+func setTCPUserTimeout(d time.Duration) func(string, string, syscall.RawConn) error {
+	return func(network, address string, c syscall.RawConn) error {
+		var sysErr error
+		var err = c.Control(func(fd uintptr) {
+			/*
+				#define TCP_USER_TIMEOUT	 18 // How long for loss retry before timeout
+			*/
 
-func (pgi *PostgreSQLInstance) connect(addr, proto string) (net.Conn, error) {
-	if proto == "" {
-		return net.Dial(defaultProto, addr)
+			sysErr = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, 0x12, int(d.Milliseconds()))
+		})
+		if sysErr != nil {
+			return os.NewSyscallError("setsockopt", sysErr)
+		}
+		return err
 	}
-
-	return net.Dial(proto, addr)
 }
 
-func NewInstanceConn(cfg *config.InstanceCFG, tlscfg *tls.Config, sslmode string) (DBInstance, error) {
+// NewInstanceConn creates a new instance connection to a PostgreSQL database.
+//
+// Parameters:
+// - host (string): The hostname of the PostgreSQL instance.
+// - availabilityZone (string): The availability zone of the PostgreSQL instance.
+// - shardname (string): The name of the shard.
+// - tlsconfig (*tls.Config): The TLS configuration to use for the SSL/TLS handshake.
+// - timeout (time.Duration): The timeout for the connection.
+// - keepAlive (time.Duration): The keep alive duration for the connection.
+// - tcpUserTimeout (time.Duration): The TCP user timeout duration for the connection.
+//
+// Returns:
+// - DBInstance: The new PostgreSQLInstance.
+// - error: An error if there was a problem creating the new PostgreSQLInstance.
+func NewInstanceConn(host string, availabilityZone string, shardname string, tlsconfig *tls.Config, timeout time.Duration, keepAlive time.Duration, tcpUserTimeout time.Duration) (DBInstance, error) {
+	dd := net.Dialer{
+		Timeout:   timeout,
+		KeepAlive: keepAlive,
 
-	tracelog.InfoLogger.Printf("initializing new postgresql instance connection to %v", cfg.ConnAddr)
+		Control: setTCPUserTimeout(tcpUserTimeout),
+	}
 
-	instance := &PostgreSQLInstance{hostname: cfg.ConnAddr, status: NotInitialized}
-
-	netconn, err := instance.connect(cfg.ConnAddr, cfg.Proto)
+	// assuming here host is in the form of hostname:port
+	netconn, err := dd.Dial("tcp", host)
 	if err != nil {
 		return nil, err
 	}
 
-	instance.conn = netconn
+	instance := &PostgreSQLInstance{
+		hostname:  host,
+		az:        availabilityZone,
+		shardname: shardname,
+		conn:      netconn,
+		status:    NotInitialized,
+		tlsconfig: tlsconfig,
+	}
 
-	if sslmode == config.SSLMODEREQUIRE {
-		err := instance.ReqBackendSsl(tlscfg)
+	if tlsconfig != nil {
+		err := instance.ReqBackendSsl(tlsconfig)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	instance.frontend, err = pgproto3.NewFrontend(pgproto3.NewChunkReader(instance.conn), instance.conn)
-	if err != nil {
-		return nil, err
-	}
+	spqrlog.Zero.Info().
+		Str("host", host).
+		Bool("ssl", tlsconfig != nil).
+		Msg("instance acquire new connection")
 
+	instance.frontend = pgproto3.NewFrontend(instance.conn, instance.conn)
 	return instance, nil
 }
 
-func (pgi *PostgreSQLInstance) CheckRW() (bool, error) {
+// Cancel cancels a PostgreSQL query execution.
+//
+// Parameters:
+// - csm: A pointer to a pgproto3.CancelRequest struct that represents the cancel request.
+//
+// Returns:
+// - error: An error if the cancel request fails, otherwise nil.
+func (pgi *PostgreSQLInstance) Cancel(csm *pgproto3.CancelRequest) error {
+	pgi.frontend.Send(csm)
+	return pgi.frontend.Flush()
+}
 
-	msg := &pgproto3.Query{
-		String: "SELECT pg_is_in_recovery()",
-	}
+// Tls returns the TLS configuration of the PostgreSQLInstance.
+//
+// Parameters:
+// - None.
+//
+// Returns:
+// - *tls.Config: The TLS configuration of the PostgreSQLInstance.
+func (pgi *PostgreSQLInstance) Tls() *tls.Config {
+	return pgi.tlsconfig
+}
 
-	if err := pgi.frontend.Send(msg); err != nil {
-		tracelog.InfoLogger.Printf("got error while checking rw %v", err)
-		return false, err
-	}
-
-	bmsg, err := pgi.frontend.Receive()
-
-	if err != nil {
-		tracelog.InfoLogger.Printf("got error while checking rw %v", err)
-		return false, err
-	}
-	tracelog.InfoLogger.Printf("got reply from %v: %T", pgi.hostname, bmsg)
-
-	switch v := bmsg.(type) {
-	case *pgproto3.DataRow:
-
-		tracelog.InfoLogger.Printf("got datarow %v", v.Values)
-
-		if len(v.Values) == 1 && v.Values[0] != nil && v.Values[0][0] == byte('t') {
-			return true, nil
-		}
-		return false, nil
-
-	default:
-		return false, xerrors.Errorf("unexcepted")
-	}
+func (pgi *PostgreSQLInstance) Conn() net.Conn {
+	return pgi.conn
 }
 
 var _ DBInstance = &PostgreSQLInstance{}
 
-func (pgi *PostgreSQLInstance) ReqBackendSsl(tlscfg *tls.Config) error {
+// TODO : unit tests
 
+// ReqBackendSsl requests the backend to enable SSL/TLS communication.
+//
+// Parameters:
+// - tlsconfig (*tls.Config): The TLS configuration to use for the SSL/TLS handshake.
+//
+// Returns:
+// - error: An error if there was a problem requesting the backend to enable SSL/TLS communication.
+//
+// This function sends a request to the backend to enable SSL/TLS communication. It first writes a 4-byte
+// message to the connection, indicating the length of the message and the SSLREQ constant. It then reads
+// a single byte response from the connection. If the response is not 'S', indicating that SSL should be
+// enabled, an error is returned. Otherwise, the connection is upgraded to use TLS using the provided
+// TLS configuration. Finally, a debug log message is printed indicating that the backend connection has
+// been initialized with TLS.
+func (pgi *PostgreSQLInstance) ReqBackendSsl(tlsconfig *tls.Config) error {
 	b := make([]byte, 4)
 	binary.BigEndian.PutUint32(b, 8)
 	// Gen salt
@@ -150,7 +306,7 @@ func (pgi *PostgreSQLInstance) ReqBackendSsl(tlscfg *tls.Config) error {
 	_, err := pgi.conn.Write(b)
 
 	if err != nil {
-		return xerrors.Errorf("ReqBackendSsl: %w", err)
+		return fmt.Errorf("ReqBackendSsl: %w", err)
 	}
 
 	resp := make([]byte, 1)
@@ -161,12 +317,13 @@ func (pgi *PostgreSQLInstance) ReqBackendSsl(tlscfg *tls.Config) error {
 
 	sym := resp[0]
 
-	tracelog.InfoLogger.Printf("recv sym %v", sym)
-
 	if sym != 'S' {
-		return xerrors.New("SSL should be enabled")
+		return fmt.Errorf("SSL should be enabled")
 	}
 
-	pgi.conn = tls.Client(pgi.conn, tlscfg)
+	pgi.conn = tls.Client(pgi.conn, tlsconfig)
+	spqrlog.Zero.Debug().
+		Uint("instance", spqrlog.GetPointer(pgi)).
+		Msg("initiated backend connection with TLS")
 	return nil
 }

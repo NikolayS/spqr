@@ -1,36 +1,149 @@
 package main
 
 import (
-	"github.com/pg-sharding/spqr/coordinator/provider"
-	"github.com/pg-sharding/spqr/qdb/qdb/mem"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"runtime"
+	"syscall"
+
+	_ "net/http/pprof"
+
+	"github.com/pg-sharding/spqr/coordinator/app"
+	coord "github.com/pg-sharding/spqr/coordinator/pkg"
+	"github.com/pg-sharding/spqr/pkg"
+	"github.com/pg-sharding/spqr/pkg/config"
+
+	"github.com/pg-sharding/spqr/pkg/spqrlog"
+	"github.com/pg-sharding/spqr/qdb"
+	spqrparser "github.com/pg-sharding/spqr/yacc/console"
 	"github.com/spf13/cobra"
-	"github.com/wal-g/tracelog"
+)
+
+var (
+	cfgPath       string
+	qdbImpl       string
+	gomaxprocs    int
+	prettyLogging bool
+	logLevel      string
 )
 
 var rootCmd = &cobra.Command{
-	Use: "keyrangeservice --config `path-to-config`",
+	Use:   "spqr-coordinator run --config `path-to-config`",
+	Short: "spqr-coordinator",
+	Long:  "spqr-coordinator",
 	CompletionOptions: cobra.CompletionOptions{
 		DisableDefaultCmd: true,
 	},
-	SilenceUsage:  true,
-	SilenceErrors: true,
-	Run: func(cmd *cobra.Command, args []string) {
-		db, _ := mem.NewQrouterDBMem()
-		c := provider.NewCoordinator(db)
-		_ = c.Run()
+	Version:       pkg.SpqrVersionRevision,
+	SilenceUsage:  false,
+	SilenceErrors: false,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		cfgStr, err := config.LoadCoordinatorCfg(cfgPath)
+		if err != nil {
+			return err
+		}
+		log.Println("Running config:", cfgStr)
+
+		if config.CoordinatorConfig().EnableRoleSystem {
+			if config.CoordinatorConfig().RolesFile == "" {
+				return fmt.Errorf("role system enabled but no roles file specified, see `enable_role_system` and `roles_file` in config")
+			}
+			rolesCfgStr, err := config.LoadRolesCfg(config.CoordinatorConfig().RolesFile)
+			if err != nil {
+				return err
+			}
+			log.Println("Running roles config:", rolesCfgStr)
+		}
+
+		if logLevel != "" {
+			config.CoordinatorConfig().LogLevel = logLevel
+		}
+		if cmd.Flags().Changed("pretty-log") {
+			config.CoordinatorConfig().PrettyLogging = prettyLogging
+		}
+
+		spqrlog.ReloadLogger(config.CoordinatorConfig().LogFileName, config.CoordinatorConfig().LogLevel, config.CoordinatorConfig().PrettyLogging)
+
+		if err := spqrparser.InitHelpRegistry(); err != nil {
+			spqrlog.Zero.Warn().Err(err).Msg("failed to initialize help registry")
+		}
+
+		if gomaxprocs > 0 {
+			runtime.GOMAXPROCS(gomaxprocs)
+		}
+
+		db, err := qdb.NewXQDB(qdbImpl)
+		if err != nil {
+			return err
+		}
+
+		// frontend
+		frTLS, err := config.CoordinatorConfig().FrontendTLS.Init(config.CoordinatorConfig().Host)
+		if err != nil {
+			return fmt.Errorf("init frontend TLS: %w", err)
+		}
+
+		coordinator, err := coord.NewClusteredCoordinator(frTLS, db)
+		if err != nil {
+			return err
+		}
+
+		sigs := make(chan os.Signal, 1)
+		signal.Notify(sigs, syscall.SIGUSR1)
+		go func() {
+			for {
+				s := <-sigs
+				spqrlog.Zero.Info().Str("signal", s.String()).Msg("received signal")
+
+				switch s {
+				case syscall.SIGUSR1:
+					spqrlog.ReloadLogger(config.CoordinatorConfig().LogFileName, config.CoordinatorConfig().LogLevel, config.CoordinatorConfig().PrettyLogging)
+				default:
+					return
+				}
+			}
+		}()
+
+		app := app.NewApp(coordinator)
+		// run pprof without wait group
+		go func() {
+			log.Println(http.ListenAndServe("localhost:6060", nil))
+		}()
+		return app.Run(true)
 	},
 }
-var cfgPath string
+
+var testCmd = &cobra.Command{
+	Use:   "test-config {path-to-config | -c path-to-config}",
+	Short: "Load, validate and print the given config file",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if len(args) > 0 {
+			cfgPath = args[0]
+		}
+		cfgStr, err := config.LoadCoordinatorCfg(cfgPath)
+		if err != nil {
+			return err
+		}
+		fmt.Println(cfgStr)
+		return nil
+	},
+}
 
 func init() {
-	rootCmd.PersistentFlags().StringVarP(&cfgPath, "config", "c", "/etc/keyrangeservice/config.yaml", "path to config file")
+	rootCmd.PersistentFlags().StringVarP(&cfgPath, "config", "c", "/etc/spqr/coordinator.yaml", "path to config file")
+	rootCmd.PersistentFlags().StringVarP(&qdbImpl, "qdb-impl", "", "etcd", "which implementation of QDB to use")
+	rootCmd.PersistentFlags().IntVarP(&gomaxprocs, "gomaxprocs", "", 0, "GOMAXPROCS value")
+	rootCmd.PersistentFlags().StringVarP(&logLevel, "log-level", "l", "", "overload for `log_level` option in router config")
+	rootCmd.PersistentFlags().BoolVarP(&prettyLogging, "pretty-log", "P", false, "enables pretty logging")
 
+	rootCmd.AddCommand(testCmd)
 }
-func Execute() {
-	if err := rootCmd.Execute(); err != nil {
-		tracelog.ErrorLogger.Fatal(err)
-	}
-}
+
 func main() {
-	Execute()
+	if err := rootCmd.Execute(); err != nil {
+		spqrlog.Zero.Error().Err(err).Msg("")
+	}
 }

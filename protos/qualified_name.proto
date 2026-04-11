@@ -1,0 +1,11 @@
+
+syntax = "proto3";
+
+package spqr;
+
+option go_package = "spqr/proto";
+
+message QualifiedName {
+  string relationName = 1;
+  string schema_name = 2;
+}

@@ -1,0 +1,78 @@
+CREATE REFERENCE TABLE t AUTO INCREMENT id;
+   create reference table    
+-----------------------------
+ table    -> t
+ shard id -> sh1,sh2,sh3,sh4
+(2 rows)
+
+CREATE REFERENCE TABLE t1 AUTO INCREMENT id;
+   create reference table    
+-----------------------------
+ table    -> t1
+ shard id -> sh1,sh2,sh3,sh4
+(2 rows)
+
+CREATE REFERENCE TABLE t2 AUTO INCREMENT id;
+   create reference table    
+-----------------------------
+ table    -> t2
+ shard id -> sh1,sh2,sh3,sh4
+(2 rows)
+
+SHOW SEQUENCES;
+ name  | value 
+-------+-------
+ t1_id | 0
+ t2_id | 0
+ t_id  | 0
+(3 rows)
+
+DROP SEQUENCE t1_id;
+ERROR:  cannot drop sequence t1_id because other objects depend on it
+HINT: Use DROP ... CASCADE to drop the dependent objects too.
+DROP REFERENCE RELATION t1;
+ relation_name 
+---------------
+ t1
+(1 row)
+
+SHOW sequences;
+ name  | value 
+-------+-------
+ t2_id | 0
+ t_id  | 0
+(2 rows)
+
+DROP SEQUENCE t1_id;
+ name  
+-------
+ t1_id
+(1 row)
+
+DROP SEQUENCE t2_id CASCADE;
+ name  
+-------
+ t2_id
+(1 row)
+
+CREATE DISTRIBUTION ds COLUMN TYPES integer;
+   add distribution    
+-----------------------
+ distribution id -> ds
+(1 row)
+
+ALTER DISTRIBUTION ds ATTACH RELATION t2 DISTRIBUTION KEY id AUTO INCREMENT id1;
+ERROR:  sequence are supported for replicated relations only
+DROP REFERENCE RELATION t;
+ relation_name 
+---------------
+ t
+(1 row)
+
+DROP DISTRIBUTION ALL CASCADE;
+ distribution_id 
+-----------------
+ REPLICATED
+ ds
+(2 rows)
+

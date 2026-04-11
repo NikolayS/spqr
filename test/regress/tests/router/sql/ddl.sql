@@ -1,0 +1,43 @@
+\c spqr-console
+
+CREATE DISTRIBUTION ds1 COLUMN TYPES integer;
+
+CREATE KEY RANGE krid2 FROM 101 ROUTE TO sh2 FOR DISTRIBUTION ds1;
+CREATE KEY RANGE krid1 FROM 1 ROUTE TO sh1 FOR DISTRIBUTION ds1;
+
+ALTER DISTRIBUTION ds1 ATTACH RELATION table_1 DISTRIBUTION KEY id;
+ALTER DISTRIBUTION ds1 ATTACH RELATION table_2 DISTRIBUTION KEY id;
+
+\c regress
+
+CREATE SCHEMA sh1;
+
+CREATE TABLE table_1(id INT PRIMARY KEY);
+CREATE TABLE table_2(id INT PRIMARY KEY);
+
+
+/* Test that this DDL simply scatters out */
+CREATE TYPE enum_name AS ENUM ('value1', 'value2', 'value3');
+
+BEGIN;
+ALTER TABLE "table_1" RENAME TO "tmp" /* __spqr__engine_v2: true */;
+ALTER TABLE "table_2" RENAME TO "table_1";
+ALTER TABLE "tmp" RENAME TO "table_2";
+COMMIT;
+
+VACUUM table_1;
+VACUUM ANALYZE;
+
+VACUUM ANALYZE table_1;
+
+CREATE type et as enum ('a', 'b');
+
+DROP TYPE et;
+
+DROP SCHEMA sh1;
+
+DROP TABLE table_1 CASCADE;
+DROP TABLE table_2;
+
+\c spqr-console
+DROP DISTRIBUTION ALL CASCADE;

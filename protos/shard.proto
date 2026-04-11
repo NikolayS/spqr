@@ -1,25 +1,47 @@
 syntax = "proto3";
 
-package yandex.spqr;
+package spqr;
 
-option go_package = "yandex/spqr/proto";
+option go_package = "spqr/proto";
+
+import "google/protobuf/empty.proto";
+
+message TLSConfig {
+  string sslmode = 1;
+  string cert_file = 2;
+  string key_file = 3;
+  string root_cert_file = 4;
+}
 
 message Shard {
-  string addr = 1;
-  string id = 2;
+  string id = 1;
+  repeated string hosts = 2;
+  TLSConfig tls = 3;
+}
+
+message ShardInfo {
+  string id = 1;
+  repeated string hosts = 2;
 }
 
 service ShardService {
-  rpc ListShards (ShardRequest) returns (ShardReply) {}
-  rpc AddDataShard (AddShardRequest) returns (AddShardReply) {}
-  rpc AddWorldShard (AddWorldShardRequest) returns (AddShardReply) {}
+  rpc ListShards (google.protobuf.Empty) returns (ListShardsReply) {}
+  rpc AddDataShard (AddShardRequest) returns (google.protobuf.Empty) {}
+  rpc UpdateShard (UpdateShardRequest) returns (google.protobuf.Empty) {}
+  rpc DropShard (DropShardRequest) returns (google.protobuf.Empty) {}
+  rpc AddWorldShard (AddWorldShardRequest) returns (google.protobuf.Empty) {}
+  rpc GetShard (ShardRequest) returns (ShardReply) {}
+}
+
+message ShardReply {
+  Shard shard = 1;
 }
 
 message ShardRequest {
   string id = 1;
 }
 
-message ShardReply {
+message ListShardsReply {
 	repeated Shard shards = 1;
 }
 
@@ -27,9 +49,14 @@ message AddShardRequest {
   Shard shard = 1;
 }
 
-message AddShardReply {
+message UpdateShardRequest {
+  Shard shard = 1;
 }
 
 message AddWorldShardRequest {
   Shard shard = 1;
+}
+
+message DropShardRequest {
+  string id = 1;
 }

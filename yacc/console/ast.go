@@ -1,27 +1,135 @@
 package spqrparser
 
 import (
-	"errors"
-	"strings"
+	"time"
+
+	"github.com/pg-sharding/lyx/lyx"
+	"github.com/pg-sharding/spqr/router/rfqn"
 )
 
+type GroupByClause any
+
+type GroupByClauseEmpty struct {
+	GroupByClause
+}
+
+type GroupBy struct {
+	GroupByClause
+	Col []*lyx.ColumnRef
+}
 type Show struct {
-	Cmd string
+	Cmd     string
+	Columns []string
+	Where   lyx.Node
+	Order   lyx.Node
+	GroupBy GroupByClause
 }
 
-type ShardingColumn struct {
-	ColName string
+type Help struct {
+	CommandName string
 }
 
-type KeyRange struct {
-	From       []byte
-	To         []byte
-	ShardID    string
-	KeyRangeID string
+func (*Help) iStatement() {}
+
+type Set struct {
+	Element Statement
 }
+
+type Create struct {
+	Element Statement
+}
+
+func (*Create) iStatement() {}
+
+type Drop struct {
+	Element       Statement
+	CascadeDelete bool
+}
+
+func (*Drop) iStatement() {}
+
+type CreateStmt interface {
+	iCreate()
+}
+
+type TraceStmt struct {
+	Client uint
+	All    bool
+}
+
+func (*TraceStmt) iStatement() {}
+
+type StopTraceStmt struct {
+}
+
+func (*StopTraceStmt) iStatement() {}
+
+type DropStmt interface {
+	iDrop()
+}
+
+type DistributionDefinition struct {
+	ID                   string
+	ColTypes             []string
+	Replicated           bool
+	AutoIncrementEntries []AutoIncrementEntry
+	DefaultShard         string
+}
+
+type ReferenceRelationDefinition struct {
+	TableName            *rfqn.RelationFQN
+	AutoIncrementEntries []*AutoIncrementEntry
+	ShardIds             []string
+}
+
+type UniqueIndexDefinition struct {
+	ID        string
+	TableName *rfqn.RelationFQN
+	Columns   []TypedColRef
+}
+
+type AutoIncrementEntry struct {
+	Column string
+	Start  uint64
+}
+
+type KeyRangeBound struct {
+	Pivots [][]byte
+}
+
+type KeyRangeDefinition struct {
+	LowerBound   *KeyRangeBound
+	ShardID      string
+	KeyRangeID   string
+	Distribution *DistributionSelector
+}
+
+type ShardDefinition struct {
+	Id           string
+	Hosts        []string
+	SslMode      string
+	CertFile     string
+	KeyFile      string
+	RootCertFile string
+}
+
+type AlterShard struct {
+	Id           string
+	SslMode      string
+	Hosts        []string
+	CertFile     string
+	KeyFile      string
+	RootCertFile string
+}
+
+func (*KeyRangeDefinition) iCreate()          {}
+func (*ShardDefinition) iCreate()             {}
+func (*DistributionDefinition) iCreate()      {}
+func (*ReferenceRelationDefinition) iCreate() {}
+func (*UniqueIndexDefinition) iCreate()       {}
 
 type SplitKeyRange struct {
-	Border         []byte
+	Border         *KeyRangeBound
 	KeyRangeFromID string
 	KeyRangeID     string
 }
@@ -36,13 +144,56 @@ type MoveKeyRange struct {
 	KeyRangeID  string
 }
 
-type Add struct {
+type RedistributeKeyRange struct {
+	DestShardID string
+	KeyRangeID  string
+	BatchSize   int
+	Id          string
+	Check       bool
+	Apply       bool
+	NoWait      bool
+}
+
+type KeyRangeSelector struct {
 	KeyRangeID string
 }
 
-type Drop struct {
-	KeyRangeID string
+type DistributionSelector struct {
+	ID string
 }
+
+type ReferenceRelationSelector struct {
+	ID string
+}
+
+type UniqueIndexSelector struct {
+	ID string
+}
+
+type ShardSelector struct {
+	ID string
+}
+
+type TaskGroupSelector struct {
+	ID string
+}
+
+type MoveTaskSelector struct {
+	ID string
+}
+
+type RedistributeTaskSelector struct {
+	ID string
+}
+
+func (*KeyRangeSelector) iDrop()          {}
+func (*DistributionSelector) iDrop()      {}
+func (*ReferenceRelationSelector) iDrop() {}
+func (*UniqueIndexSelector) iDrop()       {}
+func (*ShardSelector) iDrop()             {}
+func (*TaskGroupSelector) iDrop()         {}
+func (*MoveTaskSelector) iDrop()          {}
+func (*RedistributeTaskSelector) iDrop()  {}
 
 type Lock struct {
 	KeyRangeID string
@@ -52,27 +203,240 @@ type Unlock struct {
 	KeyRangeID string
 }
 
-type Shard struct {
-	Name string
-}
-
 type Listen struct {
 	addr string
 }
 type Shutdown struct{}
 
 type Kill struct {
-	Cmd string
+	Cmd    string
+	Target uint
 }
 
-// The frollowing constants represent SHOW statements.
+type System struct {
+	Reload  bool
+	Restart bool
+}
+
+type InvalidateCacheTarget string
+
 const (
-	ShowDatabasesStr   = "databases"
-	ShowShardsStr      = "shards"
-	ShowKeyRangesStr   = "key_ranges"
-	KillClientsStr     = "clients"
-	ShowPoolsStr       = "pools"
-	ShowUnsupportedStr = "unsupported"
+	StaleClientsInvalidateTarget       = InvalidateCacheTarget("STALE CLIENTS")
+	BackendConnectionsInvalidateTarget = InvalidateCacheTarget("BACKENDS")
+	SchemaCacheInvalidateTarget        = InvalidateCacheTarget("SCHEMA CACHE")
+)
+
+type Invalidate struct {
+	Target InvalidateCacheTarget
+}
+
+type SyncReferenceTables struct {
+	ShardID          string
+	RelationSelector string
+}
+
+type AlterReferenceTableStorage struct {
+	RelationSelector *rfqn.RelationFQN
+	Shards           []string
+}
+
+// coordinator
+
+type RegisterRouter struct {
+	Addr string
+	ID   string
+}
+
+type UnregisterRouter struct {
+	ID string
+}
+
+type Alter struct {
+	Element Statement
+}
+
+type DistributionAlterStatement interface {
+	iAlterDistribution()
+}
+
+type AlterDistribution struct {
+	Distribution *DistributionSelector
+	Element      Statement
+}
+
+func (*AlterDistribution) iStatement()         {}
+func (*AlterDistribution) iAlterDistribution() {}
+
+type TypedColRef struct {
+	Column string
+	Type   string
+}
+
+type DistributionKeyEntry struct {
+	Column       string
+	HashFunction string
+	Expr         []TypedColRef
+}
+
+type DistributedRelation struct {
+	Relation             *rfqn.RelationFQN
+	DistributionKey      []DistributionKeyEntry
+	ReplicatedRelation   bool
+	AutoIncrementEntries []*AutoIncrementEntry
+}
+
+type AttachRelation struct {
+	Relations []*DistributedRelation
+}
+
+func (*AttachRelation) iStatement()         {}
+func (*AttachRelation) iAlterDistribution() {}
+
+type AlterRelation struct {
+	Relation *DistributedRelation
+}
+
+func (*AlterRelation) iStatement()         {}
+func (*AlterRelation) iAlterDistribution() {}
+
+type AlterRelationV2 struct {
+	RelationName *rfqn.RelationFQN
+	Element      RelationAlterStmt
+}
+
+func (*AlterRelationV2) iStatement()         {}
+func (*AlterRelationV2) iAlterDistribution() {}
+
+type RelationAlterStmt interface {
+	iAlterRelation()
+	iStatement()
+}
+
+type AlterRelationSchema struct {
+	SchemaName string
+}
+
+func (*AlterRelationSchema) iStatement()     {}
+func (*AlterRelationSchema) iAlterRelation() {}
+
+type AlterRelationDistributionKey struct {
+	DistributionKey []DistributionKeyEntry
+}
+
+func (*AlterRelationDistributionKey) iStatement()     {}
+func (*AlterRelationDistributionKey) iAlterRelation() {}
+
+type RenameDistributionColumn struct {
+	OldName string
+	NewName string
+}
+
+func (*RenameDistributionColumn) iStatement()     {}
+func (*RenameDistributionColumn) iAlterRelation() {}
+
+type DetachRelation struct {
+	RelationName *rfqn.RelationFQN
+}
+
+func (*DetachRelation) iStatement()         {}
+func (*DetachRelation) iAlterDistribution() {}
+
+type AlterDefaultShard struct {
+	Shard string
+}
+
+func (*AlterDefaultShard) iStatement()         {}
+func (*AlterDefaultShard) iAlterDistribution() {}
+
+type DropDefaultShard struct {
+}
+
+func (*DropDefaultShard) iStatement()         {}
+func (*DropDefaultShard) iAlterDistribution() {}
+
+type SequenceSelector struct {
+	Name string
+}
+
+func (*SequenceSelector) iDrop() {}
+
+type RetryMoveTaskGroup struct {
+	ID     string
+	NoWait bool
+}
+
+func (*RetryMoveTaskGroup) iStatement() {}
+
+type StopMoveTaskGroup struct {
+	ID string
+}
+
+func (*StopMoveTaskGroup) iStatement() {}
+
+type ICPointAction struct {
+	Act     string
+	Timeout time.Duration /* for act = 'sleep' */
+}
+
+type InstanceControlPoint struct {
+	Name   string
+	Enable bool
+	A      *ICPointAction
+}
+
+func (*InstanceControlPoint) iStatement() {}
+
+// The following constants represent SHOW statements.
+const (
+	DatabasesStr          = "databases"
+	DistributionsStr      = "distributions"
+	CoordinatorAddrStr    = "coordinator_address"
+	RoutersStr            = "routers"
+	ShardsStr             = "shards"
+	HostsStr              = "hosts"
+	ShardingRules         = "sharding_rules"
+	KeyRangesStr          = "key_ranges"
+	KeyRangesExtendedStr  = "key_ranges_extended"
+	ClientsStr            = "clients"
+	PoolsStr              = "pools"
+	InstanceStr           = "instance"
+	BackendConnectionsStr = "backend_connections"
+	StatusStr             = "status"
+	VersionStr            = "version"
+	RelationsStr          = "relations"
+	TaskGroupStr          = "task_group"
+	TaskGroupsStr         = "task_groups"
+	PreparedStatementsStr = "prepared_statements"
+	ReferenceRelationsStr = "reference_relations"
+	UnsupportedStr        = "unsupported"
+	QuantilesStr          = "time_quantiles"
+	SequencesStr          = "sequences"
+	IsReadOnlyStr         = "is_read_only"
+	MoveStatsStr          = "move_stats"
+	TsaCacheStr           = "tsa_cache"
+	Users                 = "users"
+	MoveTaskStr           = "move_task"
+	MoveTasksStr          = "move_tasks"
+	UniqueIndexesStr      = "unique_indexes"
+	TaskGroupExtendedStr  = "task_group_ext"
+	TaskGroupsExtendedStr = "task_groups_ext"
+	RedistributeTasksStr  = "redistribute_tasks"
+	ErrorStr              = "errors"
+	StartupFinishedStr    = "startup_finished"
+	TwoPhaseTXStr         = "two_phase_tx"
+	TwoPhaseTXStorageStr  = "dcs_storage"
+	FileSettingsStr       = "file_settings"
+)
+
+// not SHOW target
+const (
+	ClientStr  = "client"
+	BackendStr = "backend"
+)
+
+const (
+	//key range for default shard
+	DEFAULT_KEY_RANGE_SUFFIX = "DEFAULT"
 )
 
 // Statement represents a statement.
@@ -80,109 +444,37 @@ type Statement interface {
 	iStatement()
 }
 
-func (*Show) iStatement()           {}
-func (*Add) iStatement()            {}
-func (*Drop) iStatement()           {}
-func (*Lock) iStatement()           {}
-func (*Unlock) iStatement()         {}
-func (*Shutdown) iStatement()       {}
-func (*Listen) iStatement()         {}
-func (*MoveKeyRange) iStatement()   {}
-func (*SplitKeyRange) iStatement()  {}
-func (*UniteKeyRange) iStatement()  {}
-func (*ShardingColumn) iStatement() {}
-func (*KeyRange) iStatement()       {}
-func (*Shard) iStatement()          {}
-func (*Kill) iStatement()           {}
+func (*Alter) iStatement()                       {}
+func (*Show) iStatement()                        {}
+func (*Set) iStatement()                         {}
+func (*KeyRangeSelector) iStatement()            {}
+func (*DistributionSelector) iStatement()        {}
+func (*ReferenceRelationSelector) iStatement()   {}
+func (*UniqueIndexSelector) iStatement()         {}
+func (*ShardSelector) iStatement()               {}
+func (*TaskGroupSelector) iStatement()           {}
+func (*MoveTaskSelector) iStatement()            {}
+func (*RedistributeTaskSelector) iStatement()    {}
+func (*SequenceSelector) iStatement()            {}
+func (*Lock) iStatement()                        {}
+func (*Unlock) iStatement()                      {}
+func (*Shutdown) iStatement()                    {}
+func (*Listen) iStatement()                      {}
+func (*MoveKeyRange) iStatement()                {}
+func (*RedistributeKeyRange) iStatement()        {}
+func (*SplitKeyRange) iStatement()               {}
+func (*UniteKeyRange) iStatement()               {}
+func (*DistributionDefinition) iStatement()      {}
+func (*ReferenceRelationDefinition) iStatement() {}
+func (*UniqueIndexDefinition) iStatement()       {}
+func (*KeyRangeDefinition) iStatement()          {}
+func (*ShardDefinition) iStatement()             {}
+func (*AlterShard) iStatement()                  {}
+func (*Kill) iStatement()                        {}
+func (*System) iStatement()                      {}
+func (*Invalidate) iStatement()                  {}
+func (*SyncReferenceTables) iStatement()         {}
+func (*AlterReferenceTableStorage) iStatement()  {}
 
-var reservedWords = map[string]int{
-	"pools":      POOLS,
-	"servers":    SERVERS,
-	"clients":    CLIENTS,
-	"databases":  DATABASES,
-	"show":       SHOW,
-	"stats":      STATS,
-	"kill":       KILL,
-	"column":     COLUMN,
-	"sharding":   SHARDING,
-	"create":     CREATE,
-	"add":        ADD,
-	"key":        KEY,
-	"range":      RANGE,
-	"shards":     SHARDS,
-	"key_ranges": KEY_RANGES,
-	"lock":       LOCK,
-	"unlock":     UNLOCK,
-	"drop":       DROP,
-	"shitdown":   SHUTDOWN,
-	"split":      SPLIT,
-	"from":       FROM,
-	"by":         BY,
-	"with":       WITH,
-	"unite":      UNITE,
-	"listen":     LISTEN,
-}
-
-// Tokenizer is the struct used to generate SQL
-// tokens for the parser.
-type Tokenizer struct {
-	s   string
-	pos int
-
-	ParseTree Statement
-	LastError string
-}
-
-func (t *Tokenizer) Lex(lval *yySymType) int {
-	var c rune = ' '
-
-	// skip through all the spaces, both at the ends and in between
-	for c == ' ' {
-		if t.pos == len(t.s) {
-			return 0
-		}
-		c = rune(t.s[t.pos])
-		t.pos += 1
-	}
-
-	tok := ""
-
-	// skip through all the spaces, both at the ends and in between
-	for c != ' ' {
-		if t.pos == len(t.s) {
-			break
-		}
-		tok = tok + string(c)
-		c = rune(t.s[t.pos])
-		t.pos += 1
-	}
-	lval.str = tok
-
-	if tp, ok := reservedWords[strings.ToLower(tok)]; ok {
-		return tp
-	}
-
-	return STRING
-}
-
-func (t *Tokenizer) Error(s string) {
-	t.LastError = s
-}
-
-func NewStringTokenizer(sql string) *Tokenizer {
-	return &Tokenizer{s: sql}
-}
-
-func setParseTree(yylex interface{}, stmt Statement) {
-	yylex.(*Tokenizer).ParseTree = stmt
-}
-
-func Parse(sql string) (Statement, error) {
-
-	tokenizer := NewStringTokenizer(sql)
-	if yyParse(tokenizer) != 0 {
-		return nil, errors.New(tokenizer.LastError)
-	}
-	ast := tokenizer.ParseTree
-	return ast, nil
-}
+func (*RegisterRouter) iStatement()   {}
+func (*UnregisterRouter) iStatement() {}

@@ -1,0 +1,346 @@
+Feature: Proxy console
+    Background:
+        #
+        # Run routers with coordinators
+        # Stop all coordinators
+        #
+        Given cluster environment is
+        """
+        ROUTER_CONFIG=/spqr/test/feature/conf/router_with_coordinator.yaml
+        ROUTER_COORDINATOR_CONFIG=/spqr/test/feature/conf/router_coordinator.yaml
+        ROUTER_2_COORDINATOR_CONFIG=/spqr/test/feature/conf/router_coordinator_2.yaml
+        """
+        Given cluster is up and running
+        And host "coordinator" is stopped
+        And host "coordinator2" is stopped
+
+        #
+        # Make host "router" take control over coordinator
+        #
+        Given host "router2" is stopped
+        And I wait for coordinator "regress_router" to take control
+        And I wait for coordinator address on router "router-admin" to become "regress_router:7003"
+        And host "router2" is started
+        And I wait for host "router2" to respond
+
+        When I run SQL on host "router-admin"
+        """
+        UNREGISTER ROUTER ALL;
+        REGISTER ROUTER r1 ADDRESS "[regress_router]:7000";
+        REGISTER ROUTER r2 ADDRESS "[regress_router_2]:7000";
+        """
+        Then command return code should be "0"
+
+# TODO: check distributions in this test
+    Scenario: Add key_range is executed in coordinator
+        When I run SQL on host "router-admin"
+        """
+        CREATE DISTRIBUTION ds1 COLUMN TYPES integer;
+        CREATE KEY RANGE krid1 FROM 0 ROUTE TO sh1 FOR DISTRIBUTION ds1;
+        """
+        Then command return code should be "0"
+
+        #
+        # Check on first router
+        #
+        When I run SQL on host "router-admin"
+        """
+        SHOW key_ranges
+        """
+        Then SQL result should match json_exactly
+        """
+        [{
+            "key_range_id":"krid1",
+            "distribution_id":"ds1",
+            "lower_bound":"0",
+            "shard_id":"sh1",
+            "locked":"false"
+        }]
+        """
+
+        #
+        # Check on second router
+        #
+        When I run SQL on host "router2-admin"
+        """
+        SHOW key_ranges
+        """
+        Then SQL result should match json_exactly
+        """
+        [{
+            "key_range_id":"krid1",
+            "distribution_id":"ds1",
+            "lower_bound":"0",
+            "shard_id":"sh1",
+            "locked":"false"
+        }]
+        """
+
+    Scenario: Lock/Unlock key_range are executed in coordinator
+        When I run SQL on host "router-admin"
+        """
+        CREATE DISTRIBUTION ds1 COLUMN TYPES integer;
+        CREATE KEY RANGE krid1 FROM 0 ROUTE TO sh1 FOR DISTRIBUTION ds1;
+        ALTER DISTRIBUTION ds1 ATTACH RELATION test DISTRIBUTION KEY id;
+        """
+        Then command return code should be "0"
+
+        When I run SQL on host "router"
+        """
+        CREATE TABLE test(id int);
+        """
+        Then command return code should be "0"
+
+        When I run SQL on host "router-admin"
+        """
+        LOCK KEY RANGE krid1;
+        """
+        Then command return code should be "0"
+
+        When I run SQL on host "router2"
+        """
+        SELECT * FROM test WHERE id=5;
+        """
+        Then SQL error on host "router2" should match regexp
+        """
+        key range .* is locked
+        """
+
+        When I run SQL on host "router-admin"
+        """
+        UNLOCK KEY RANGE krid1;
+        """
+        Then command return code should be "0"
+
+        When I run SQL on host "router2"
+        """
+        SELECT * FROM test WHERE id=5;
+        """
+        Then command return code should be "0"
+
+    Scenario: Split/Unite key_range are executed in coordinator
+        When I run SQL on host "router-admin"
+        """
+        CREATE DISTRIBUTION ds1 COLUMN TYPES integer;
+        CREATE KEY RANGE krid1 FROM 0 ROUTE TO sh1 FOR DISTRIBUTION ds1;
+        SPLIT KEY RANGE new_krid FROM krid1 BY 5;
+        """
+        Then command return code should be "0"
+
+        When I run SQL on host "router2-admin"
+        """
+        SHOW key_ranges;
+        """
+        Then SQL result should match json_exactly
+        """
+        [{
+            "key_range_id":"krid1",
+            "distribution_id":"ds1",
+            "lower_bound":"0",
+            "shard_id":"sh1",
+            "locked":"false"
+        },
+        {
+            "key_range_id":"new_krid",
+            "distribution_id":"ds1",
+            "lower_bound":"5",
+            "shard_id":"sh1",
+            "locked":"false"
+        }]
+        """
+
+        When I run SQL on host "router-admin"
+        """
+        UNITE KEY RANGE krid1 WITH new_krid;
+        """
+        Then command return code should be "0"
+
+        When I run SQL on host "router2-admin"
+        """
+        SHOW key_ranges
+        """
+        Then SQL result should match json_exactly
+        """
+        [{
+            "key_range_id":"krid1",
+            "distribution_id":"ds1",
+            "lower_bound":"0",
+            "shard_id":"sh1",
+            "locked":"false"
+        }]
+        """
+
+    Scenario: Move is executed in coordinator
+        When I run SQL on host "router-admin"
+        """
+        CREATE DISTRIBUTION ds1 COLUMN TYPES integer;
+        CREATE KEY RANGE krid1 FROM 0 ROUTE TO sh1  FOR DISTRIBUTION ds1;
+        ALTER DISTRIBUTION ds1 ATTACH RELATION test DISTRIBUTION KEY id;
+        """
+        Then command return code should be "0"
+
+        When I run SQL on host "router"
+        """
+        CREATE TABLE test(id int);
+        INSERT INTO test(id) VALUES(2);
+        INSERT INTO test(id) VALUES(7);
+        """
+        Then command return code should be "0"
+
+        When I run SQL on host "router-admin"
+        """
+        MOVE KEY RANGE krid1 TO sh2;
+        """
+        Then command return code should be "0"
+
+        When I run SQL on host "shard2"
+        """
+        SELECT * FROM test;
+        """
+        Then SQL result should match json_exactly
+        """
+        [{
+            "id":2
+        },
+        {
+            "id":7
+        }]
+        """
+
+    Scenario: Show key_ranges is executed in router
+        When I run SQL on host "router-admin"
+        """
+        CREATE DISTRIBUTION ds1 COLUMN TYPES integer;
+        CREATE KEY RANGE old_krid FROM 100 ROUTE TO sh2 FOR DISTRIBUTION ds1;
+        UNREGISTER ROUTER r1;
+        CREATE KEY RANGE new_krid FROM 0 ROUTE TO sh1 FOR DISTRIBUTION ds1;
+        """
+        Then command return code should be "0"
+
+        When I run SQL on host "router-admin"
+        """
+        SHOW key_ranges
+        """
+        Then SQL result should match json_exactly
+        """
+        [{
+            "key_range_id":"old_krid",
+            "distribution_id":"ds1",
+            "lower_bound":"100",
+            "shard_id":"sh2",
+            "locked":"false"
+        }]
+        """
+
+    Scenario: Show routers is executed in coordinator
+        When I run SQL on host "router-admin"
+        """
+        SHOW routers;
+        """
+        Then SQL result should match regexp
+        """
+        \[regress_router\]:7000
+        """
+        And SQL result should match regexp
+        """
+        \[regress_router_2\]:7000
+        """
+    
+    Scenario: SHOW move_task is executed in coordinator
+        When I run SQL on host "router-admin"
+        """
+        CREATE DISTRIBUTION ds1 COLUMN TYPES integer;
+        CREATE KEY RANGE kr_from FROM 0 ROUTE TO sh1;
+        CREATE KEY RANGE kr_to FROM 20 ROUTE TO sh1;
+        """
+        Then command return code should be "0"
+        When I record in qdb move task group
+        """
+        {
+            "id":            "tgid1",
+            "shard_to_id":   "sh_to",
+            "kr_id_from":    "kr_from",
+            "kr_id_to":      "kr_to",
+            "type":          1,
+            "limit":         -1,
+            "coeff":         0.75,
+            "bound_rel":     "test",
+            "total_keys":    200,
+            "task":
+            {
+                "id":            "2",
+                "kr_id_temp":    "temp_id",
+                "bound":         ["FAAAAAAAAAA="],
+                "state":         0,
+                "task_group_id": "tgid1"
+            }
+        }
+        """
+        Then command return code should be "0"
+        When I run SQL on host "router-admin"
+        """
+        SHOW task_group
+        """
+        Then command return code should be "0"
+        And SQL result should match json
+        """
+        [{
+            "task_group_id":            "tgid1",
+            "destination_shard_id":     "sh_to",
+            "source_key_range_id":      "kr_from",
+            "destination_key_range_id": "kr_to",
+            "batch_size":               "0",
+            "move_task_id":             "2",
+            "state":                    "PLANNED",
+            "message":                  ""
+        }]
+        """
+        When I run SQL on host "router-admin"
+        """
+        SHOW move_task
+        """
+        Then command return code should be "0"
+        And SQL result should match json_exactly
+        """
+        [{
+            "move_task_id":             "2",
+            "state":                    "PLANNED",
+            "bound":                    "10",
+            "temporary_key_range_id":   "temp_id",
+            "task_group_id":            "tgid1"
+        }]
+        """
+    
+    Scenario: add and drop shard on router-admin
+        When I run SQL on host "router-admin"
+        """
+        CREATE SHARD sh5 WITH HOSTS klepov:6432;
+        """
+        Then command return code should be "0"
+
+        When I run SQL on host "router-admin"
+        """
+        SHOW shards;
+        """
+        Then command return code should be "0"
+        And SQL result should match json_exactly
+        """
+        [{"shard":"sh1"}, {"shard":"sh2"} ,{"shard":"sh5"}]
+        """
+
+        When I run SQL on host "router-admin"
+        """
+        DROP SHARD sh5;
+        """
+        Then command return code should be "0"
+
+        When I run SQL on host "router-admin"
+        """
+        SHOW shards;
+        """
+        Then command return code should be "0"
+        And SQL result should match json_exactly
+        """
+        [{"shard":"sh1"}, {"shard":"sh2"}]
+        """
+    

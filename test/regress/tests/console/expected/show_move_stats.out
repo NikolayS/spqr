@@ -1,0 +1,5 @@
+SHOW move_stats;
+ statistic | time 
+-----------+------
+(0 rows)
+

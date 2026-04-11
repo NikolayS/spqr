@@ -1,22 +1,16 @@
 package coordinator
 
 import (
-	"github.com/pg-sharding/spqr/qdb/qdb"
-	router2 "github.com/pg-sharding/spqr/router/pkg"
-	"github.com/pg-sharding/spqr/world"
-	spqrparser "github.com/pg-sharding/spqr/yacc/console"
+	"context"
+
+	"github.com/pg-sharding/spqr/pkg/clientinteractor"
+	"github.com/pg-sharding/spqr/pkg/meta"
 )
 
 type Coordinator interface {
-	AddShardingColumn(col string) error
-	AddLocalTable(tname string) error
+	clientinteractor.Interactor
+	meta.EntityMgr
 
-	AddKeyRange(kr qdb.KeyRange) error
-
-	Lock(krid string) error
-	UnLock(krid string) error
-	Split(req *spqrparser.SplitKeyRange) error
-	Unite(req *spqrparser.UniteKeyRange) error
-	RegisterRouter(r router2.Router) error
-	RegisterWorld(w world.World) error
+	RunCoordinator(ctx context.Context, initialRouter bool)
+	IsReadOnly() bool
 }

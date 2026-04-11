@@ -1,0 +1,5 @@
+SHOW tsa_cache;
+ tsa | host | az | alive | match | reason | last_check_time 
+-----+------+----+-------+-------+--------+-----------------
+(0 rows)
+

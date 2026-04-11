@@ -1,0 +1,34 @@
+CREATE DISTRIBUTION ds1 COLUMN TYPES integer;
+    add distribution    
+------------------------
+ distribution id -> ds1
+(1 row)
+
+CREATE DISTRIBUTION ds2 COLUMN TYPES varchar, integer;
+    add distribution    
+------------------------
+ distribution id -> ds2
+(1 row)
+
+CREATE DISTRIBUTION ds3 COLUMN TYPES integer hash DEFAULT SHARD sh1;
+    add distribution    
+------------------------
+ distribution id -> ds3
+(1 row)
+
+SHOW distributions;
+ distribution_id |  column_types   | default_shard 
+-----------------+-----------------+---------------
+ ds1             | integer         | not exists
+ ds2             | varchar,integer | not exists
+ ds3             | uinteger        | sh1
+(3 rows)
+
+DROP DISTRIBUTION ALL CASCADE;
+ distribution_id 
+-----------------
+ ds1
+ ds2
+ ds3
+(3 rows)
+

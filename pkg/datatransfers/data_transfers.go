@@ -1,0 +1,972 @@
+package datatransfers
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/pg-sharding/spqr/coordinator/statistics"
+	"github.com/pg-sharding/spqr/pkg/icp"
+	"github.com/pg-sharding/spqr/pkg/meta"
+	"github.com/pg-sharding/spqr/pkg/models/distributions"
+	"github.com/pg-sharding/spqr/pkg/models/rrelation"
+	"github.com/pg-sharding/spqr/pkg/models/spqrerror"
+	"github.com/pg-sharding/spqr/pkg/shard"
+	"github.com/pg-sharding/spqr/router/rfqn"
+	"github.com/sethvargo/go-retry"
+	"github.com/spaolacci/murmur3"
+
+	pgx "github.com/jackc/pgx/v5"
+	_ "github.com/lib/pq"
+	"github.com/pg-sharding/spqr/pkg/config"
+	"github.com/pg-sharding/spqr/pkg/models/kr"
+	"github.com/pg-sharding/spqr/pkg/spqrlog"
+	"github.com/pg-sharding/spqr/qdb"
+)
+
+const (
+	spqrguardDistributedRelationsLock = 42
+	spqrguardReferenceRelationLock    = 69
+)
+
+const spqrTransferApplicationName = "spqr-transfer"
+
+type MoveTableRes struct {
+	TableSchema string `db:"table_schema"`
+	TableName   string `db:"table_name"`
+}
+
+// TODO: use schema
+// var schema = flag.String("schema", "", "")
+
+type ProxyW struct {
+	w io.WriteCloser
+}
+
+// Write writes the given byte slice to the underlying io.WriteCloser.
+//
+// Parameters:
+// - bt ([]byte): a byte slice to be written.
+//
+// Returns:
+// - int: the number of bytes written.
+// - error: an error, if any, that occurred during the
+func (p *ProxyW) Write(bt []byte) (int, error) {
+	return p.w.Write(bt)
+}
+
+var shards *config.DatatransferConnections
+var lock sync.RWMutex
+
+var localConfigDir = "/../../cmd/mover/shard_data.yaml"
+
+// createConnString generates a connection string for the specified shard ID.
+//
+// Parameters:
+// - shardID (string): The ID of the shard for which the connection string is generated.
+//
+// Returns:
+// - string: The generated connection string. If the shard ID is not found or if there are no hosts for the shard, an empty string is returned.
+func createConnString(shardID string) string {
+	lock.Lock()
+	defer lock.Unlock()
+
+	sd, ok := shards.ShardsData[shardID]
+	if !ok {
+		return ""
+	}
+	if len(sd.Hosts) == 0 {
+		return ""
+	}
+	// TODO find_master
+	host := strings.Split(sd.Hosts[0], ":")[0]
+	port := strings.Split(sd.Hosts[0], ":")[1]
+	return fmt.Sprintf("user=%s host=%s port=%s dbname=%s password=%s", sd.User, host, port, sd.DB, sd.Password)
+}
+
+// LoadConfig loads the configuration from the specified path or the localConfigDir directory.
+//
+// Parameters:
+// - path (string): the path to the configuration file.
+//
+// Returns:
+// - error: an error if the configuration cannot be loaded.
+func LoadConfig(path string) error {
+	spqrlog.Zero.Debug().Msg("called LoadConfig")
+	var err error
+	lock.Lock()
+	defer lock.Unlock()
+
+	shards, err = config.LoadShardDataCfg(path)
+	if err != nil {
+		p, _ := os.Getwd()
+		shards, err = config.LoadShardDataCfg(p + localConfigDir)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+/*
+MoveKeys performs physical key-range move from one datashard to another.
+It is assumed that passed key range is already locked on every online spqr-router.
+
+Steps:
+  - create postgres_fdw on receiving shard
+  - copy data from sending shard to receiving shard via fdw
+  - delete data from sending shard
+*/
+
+// MoveKeys performs physical key-range move from one datashard to another.
+//
+// It is assumed that the passed key range is already locked on every online spqr-router.
+// The function performs the following steps:
+//   - Create a postgres_fdw on the receiving shard.
+//   - Copy data from the sending shard to the receiving shard via fdw.
+//   - Delete data from the sending shard.
+//
+// Parameters:
+//   - ctx (context.Context): The context for the function.
+//   - fromId (string): the ID of the sending shard.
+//   - toId (string): the ID of the receiving shard.
+//   - krg (*kr.KeyRange): the KeyRange object representing the key range being moved.
+//   - ds (*distributions.Distribution): the Distributions object representing the distribution of data.
+//   - db (qdb.XQDB): the XQDB object for interacting with the database.
+//   - cr (coordinator.Coordinator): the Coordinator object for coordinating the move.
+//
+// Returns:
+//   - error: an error if the move fails.
+func MoveKeys(ctx context.Context, fromId, toId string, krg *kr.KeyRange, ds *distributions.Distribution, db qdb.XQDB, mgr meta.EntityMgr, executorId string) error {
+	if toId == fromId {
+		return fmt.Errorf("incorrect request to move data in key range \"%s\": source and destination shards are the same", krg.ID)
+	}
+	tx, err := db.GetTransferTx(ctx, krg.ID)
+	if err != nil {
+		return err
+	}
+	if tx == nil {
+		// No transaction in progress
+		tx = &qdb.DataTransferTransaction{
+			ToShardId:   toId,
+			FromShardId: fromId,
+			Status:      qdb.Planned,
+		}
+		if err = db.RecordTransferTx(ctx, krg.ID, tx); err != nil {
+			return err
+		}
+	}
+	if shards == nil {
+		err := LoadConfig(config.CoordinatorConfig().ShardDataCfg)
+		if err != nil {
+			spqrlog.Zero.Error().Err(err).Msg("error loading config")
+		}
+	}
+	fromCfg, ok := shards.ShardsData[fromId]
+	if !ok {
+		return spqrerror.Newf(spqrerror.SPQR_TRANSFER_ERROR, "shard with ID \"%s\" not found in config", fromId)
+	}
+	from, err := GetMasterConnection(ctx, fromCfg, executorId)
+	if err != nil {
+		spqrlog.Zero.Error().Err(err).Msg("error connecting to shard")
+		return err
+	}
+	defer func() {
+		_ = from.Close(ctx)
+	}()
+	toCfg, ok := shards.ShardsData[toId]
+	if !ok {
+		return spqrerror.Newf(spqrerror.SPQR_TRANSFER_ERROR, "shard with ID \"%s\" not found in config", toId)
+	}
+	to, err := GetMasterConnection(ctx, toCfg, executorId)
+	if err != nil {
+		spqrlog.Zero.Error().Err(err).Msg("error connecting to shard")
+		return err
+	}
+	defer func() {
+		_ = to.Close(ctx)
+	}()
+
+	upperBound, err := resolveNextBound(ctx, krg, mgr)
+	if err != nil {
+		return err
+	}
+
+	for tx != nil {
+		switch tx.Status {
+		case qdb.Planned:
+			t := time.Now()
+			// Await all current virtual transactions on source shard to stop
+			if err := awaitPIDs(ctx, from); err != nil {
+				return fmt.Errorf("failed to await virtual transactions to exit: %s", err)
+			}
+			tx.Status = qdb.Locked
+			err = db.RecordTransferTx(ctx, krg.ID, tx)
+			statistics.RecordShardOperation("awaitPIDs", time.Since(t))
+			if err != nil {
+				return err
+			}
+		case qdb.Locked:
+			t := time.Now()
+			// copy data of key range to receiving shard
+			if err = copyData(ctx, from, to, fromId, toId, krg, ds, upperBound); err != nil {
+				return err
+			}
+			tx.Status = qdb.DataCopied
+			err = db.RecordTransferTx(ctx, krg.ID, tx)
+			statistics.RecordShardOperation("copyData", time.Since(t))
+			if err != nil {
+				return err
+			}
+		case qdb.DataCopied:
+			// drop data from sending shard
+			t := time.Now()
+			ftx, err := from.Begin(ctx)
+			if err != nil {
+				return fmt.Errorf("could not delete data: could not begin transaction: %s", err)
+			}
+			if _, err := ftx.Exec(ctx, "SET CONSTRAINTS ALL DEFERRED"); err != nil {
+				return fmt.Errorf("could not delete data: error deferring constraints: %s", err)
+			}
+			if config.CoordinatorConfig().DataMoveDisableTriggers {
+				if _, err := ftx.Exec(ctx, "SET session_replication_role = replica"); err != nil {
+					return fmt.Errorf("failed to disable triggers: %s", err)
+				}
+			}
+			for _, rel := range ds.ListRelations() {
+				res := ftx.QueryRow(ctx, fmt.Sprintf(
+					`
+					SELECT 
+						count(*) > 0 as table_exists
+					FROM information_schema.tables
+					WHERE table_name = '%s' AND table_schema = '%s'`, strings.ToLower(rel.Relation.RelationName), rel.Relation.GetSchema()))
+				fromTableExists := false
+				if err = res.Scan(&fromTableExists); err != nil {
+					return err
+				}
+				if !fromTableExists {
+					continue
+				}
+				cond, err := kr.GetKRCondition(rel, krg, upperBound, "")
+				if err != nil {
+					return err
+				}
+				_, err = ftx.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE %s`, rel.QualifiedName().String(), cond))
+				if err != nil {
+					return fmt.Errorf("could not delete data: error executing DELETE FROM: %s", err)
+				}
+			}
+			if err = ftx.Commit(ctx); err != nil {
+				return fmt.Errorf("could not delete data: could not commit transaction: %s", err)
+			}
+			statistics.RecordShardOperation("dropData", time.Since(t))
+			if err = db.RemoveTransferTx(ctx, krg.ID); err != nil {
+				return err
+			}
+			tx = nil
+		default:
+			return fmt.Errorf("incorrect data transfer transaction status: %s", tx.Status)
+		}
+	}
+
+	return nil
+}
+
+func SyncReferenceRelation(ctx context.Context, fromId, toId string, rel *rrelation.ReferenceRelation, db qdb.XQDB) error {
+	tx, err := db.GetTransferTx(ctx, rel.RelationName.String())
+	if err != nil {
+		return err
+	}
+
+	transferKey := rel.QualifiedName().String()
+
+	if tx == nil {
+		// No transaction in progress
+		tx = &qdb.DataTransferTransaction{
+			ToShardId:   toId,
+			FromShardId: fromId,
+			Status:      qdb.Planned,
+		}
+		if err = db.RecordTransferTx(ctx, transferKey, tx); err != nil {
+			return err
+		}
+	}
+	if shards == nil {
+		err := LoadConfig(config.CoordinatorConfig().ShardDataCfg)
+		if err != nil {
+			spqrlog.Zero.Error().Err(err).Msg("error loading config")
+		}
+	}
+	fromCfg, ok := shards.ShardsData[fromId]
+	if !ok {
+		return spqrerror.Newf(spqrerror.SPQR_TRANSFER_ERROR, "shard with ID \"%s\" not found in config", fromId)
+	}
+	from, err := GetMasterConnection(ctx, fromCfg, "")
+	if err != nil {
+		spqrlog.Zero.Error().Err(err).Msg("error connecting to shard")
+		return err
+	}
+	defer func() {
+		_ = from.Close(ctx)
+	}()
+	toCfg, ok := shards.ShardsData[toId]
+	if !ok {
+		return spqrerror.Newf(spqrerror.SPQR_TRANSFER_ERROR, "shard with ID \"%s\" not found in config", toId)
+	}
+	to, err := GetMasterConnection(ctx, toCfg, "reference_table_sync")
+	if err != nil {
+		spqrlog.Zero.Error().Err(err).Msg("error connecting to shard")
+		return err
+	}
+	defer func() {
+		_ = to.Close(ctx)
+	}()
+
+	for tx != nil {
+		switch tx.Status {
+		case qdb.Planned:
+			// lock reference relation on its current shards
+			if err = lockReferenceRelation(ctx, rel); err != nil {
+				return err
+			}
+			tx.Status = qdb.Locked
+			err = db.RecordTransferTx(ctx, transferKey, tx)
+			if err != nil {
+				return err
+			}
+		case qdb.Locked:
+			// copy data of key range to receiving shard
+			if err = copyReferenceRelationData(ctx, from, to, fromId, toId, rel); err != nil {
+				return err
+			}
+			tx.Status = qdb.DataCopied
+			err = db.RecordTransferTx(ctx, transferKey, tx)
+			if err != nil {
+				return err
+			}
+		case qdb.DataCopied:
+			// unlock reference relation
+			if err = unlockReferenceRelation(ctx, rel); err != nil {
+				return err
+			}
+			if err = db.RemoveTransferTx(ctx, transferKey); err != nil {
+				return err
+			}
+			tx = nil
+		default:
+			return fmt.Errorf("incorrect data transfer transaction status: %s", tx.Status)
+		}
+	}
+
+	return nil
+}
+
+// resolveNextBound finds the next lower bound key range from the given key range list that is greater than the lower bound of the given key range.
+//
+// Parameters:
+// - ctx (context.Context): The context for the function.
+// - krg (*kr.KeyRange): the key range for which the next lower bound is to be found.
+// - cr (coordinator.Coordinator): the coordinator.Coordinator object used to list key ranges.
+//
+// Returns:
+// - kr.KeyRangeBound: the next lower bound key range found, or nil if no such key range exists.
+// - error: an error if the key range list cannot be retrieved or if there is an error in the function execution.
+func resolveNextBound(ctx context.Context, krg *kr.KeyRange, cr meta.EntityMgr) (kr.KeyRangeBound, error) {
+	krs, err := cr.ListKeyRanges(ctx, krg.Distribution)
+	if err != nil {
+		return nil, err
+	}
+	ds, err := cr.GetDistribution(ctx, krg.Distribution)
+	if err != nil {
+		return nil, err
+	}
+	var bound kr.KeyRangeBound
+	for _, kRange := range krs {
+		if kr.CmpRangesLess(krg.LowerBound, kRange.LowerBound, ds.ColTypes) && (bound == nil || kr.CmpRangesLess(kRange.LowerBound, bound, ds.ColTypes)) {
+			bound = kRange.LowerBound
+		}
+	}
+	return bound, nil
+}
+
+func SetupFDW(
+	ctx context.Context,
+	to *pgx.Conn,
+	fromShardId, toShardId string,
+	schemas map[string]struct{}) error {
+	if shards == nil {
+		err := LoadConfig(config.CoordinatorConfig().ShardDataCfg)
+		if err != nil {
+			spqrlog.Zero.Error().Err(err).Msg("error loading config")
+			return err
+		}
+	}
+
+	fromShard := shards.ShardsData[fromShardId]
+	toShard := shards.ShardsData[toShardId]
+	dbName := fromShard.DB
+	fromHost, err := GetMasterHost(ctx, fromShard)
+	if err != nil {
+		return err
+	}
+	hasher := murmur3.New64()
+	if _, err := hasher.Write(fmt.Appendf(nil, "%s_%s_%s_%s_%s", toShardId, strings.Split(toShard.Hosts[0], ":")[0], dbName, fromShardId, fromHost)); err != nil {
+		return err
+	}
+	serverNameHash := hasher.Sum64()
+	serverName := fmt.Sprintf("spqr_transfer_server_%x", serverNameHash)
+	// create postgres_fdw server on receiving shard
+	_, err = to.Exec(ctx, fmt.Sprintf(`CREATE SERVER IF NOT EXISTS %s FOREIGN DATA WRAPPER postgres_fdw OPTIONS (dbname '%s', host '%s', port '%s', fetch_size '10000', extensions 'spqrhash', updatable 'false', truncatable 'false', application_name '%s')`, serverName, dbName, fromHost, strings.Split(fromShard.Hosts[0], ":")[1], spqrTransferApplicationName))
+	if err != nil {
+		return err
+	}
+	if _, err = to.Exec(ctx, fmt.Sprintf(`CREATE USER MAPPING IF NOT EXISTS FOR %s SERVER %s OPTIONS (user '%s', password '%s')`, toShard.User, serverName, fromShard.User, fromShard.Password)); err != nil {
+		return err
+	}
+	// create foreign tables corresponding to such on sending shard
+	// TODO check if schemaName is not used by relations (needs schemas in distributions)
+	for schema := range schemas {
+		if err := func() error {
+			schemaName := fmt.Sprintf("%s_%s", serverName, schema)
+			tx, err := to.Begin(ctx)
+			/* on any error, rollback */
+			defer func() {
+				err := tx.Rollback(ctx)
+				if err != nil {
+					spqrlog.Zero.Error().Err(err).Msg("failed to rollback move data transaction")
+				}
+			}()
+
+			if err != nil {
+				return err
+			}
+			row := tx.QueryRow(ctx, fmt.Sprintf(`SELECT count(*) > 0 as schema_exists FROM pg_namespace WHERE nspname = '%s'`, schemaName))
+			exist := false
+			if err := row.Scan(&exist); err != nil {
+				return err
+			}
+			if exist {
+				return nil
+			}
+			if _, err = tx.Exec(ctx, fmt.Sprintf(`CREATE SCHEMA %s`, schemaName)); err != nil {
+				return err
+			}
+			if _, err = tx.Exec(ctx, fmt.Sprintf(`IMPORT FOREIGN SCHEMA %s FROM SERVER %s INTO %s`, schema, serverName, schemaName)); err != nil {
+				return err
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return err
+			}
+			return nil
+		}(); err != nil {
+			return err
+		}
+	}
+	return err
+}
+
+func lockReferenceRelation(ctx context.Context, relation *rrelation.ReferenceRelation) error {
+	for _, shard := range relation.ShardIds {
+		connInfo, ok := shards.ShardsData[shard]
+		if !ok {
+			return fmt.Errorf("no connection info for shard \"%s\", relation \"%s\"", shard, relation.QualifiedName().String())
+		}
+		shardConn, err := GetMasterConnection(ctx, connInfo, "lock_reference_relation")
+		if err != nil {
+			return fmt.Errorf("can't lock relation \"%s\": %s", relation.QualifiedName().String(), err)
+		}
+		defer func() {
+			_ = shardConn.Close(ctx)
+		}()
+		if err = lockReferenceRelationOnShard(ctx, shardConn, relation.QualifiedName()); err != nil {
+			return fmt.Errorf("can't lock relation \"%s\": %s", relation.QualifiedName().String(), err)
+		}
+	}
+	return nil
+}
+
+func lockReferenceRelationOnShard(ctx context.Context, shardConn *pgx.Conn, relation *rfqn.RelationFQN) error {
+	tx, err := shardConn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, "LOCK TABLE spqr_metadata.spqr_global_settings IN ACCESS EXCLUSIVE MODE"); err != nil {
+		return err
+	}
+	row := tx.QueryRow(ctx, "SELECT enabled as references_locked FROM spqr_metadata.spqr_global_settings WHERE name = $1", spqrguardReferenceRelationLock)
+	val := false
+	if err = row.Scan(&val); err != nil && err != pgx.ErrNoRows {
+		return err
+	}
+	// TODO: process differently to avoid deadlocks
+	if val {
+		return spqrerror.Newf(spqrerror.SPQR_TRANSFER_ERROR, "reference relations already locked")
+	}
+	if _, err = tx.Exec(ctx, "SELECT spqr_metadata.mark_reference_relation($1)", relation.String()); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, "INSERT INTO spqr_metadata.spqr_global_settings (name, enabled) VALUES ($1, true)", spqrguardReferenceRelationLock); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func unlockReferenceRelation(ctx context.Context, relation *rrelation.ReferenceRelation) error {
+	for _, shard := range relation.ShardIds {
+		connInfo, ok := shards.ShardsData[shard]
+		if !ok {
+			return fmt.Errorf("no connection info for shard \"%s\", relation \"%s\"", shard, relation.QualifiedName().String())
+		}
+		shardConn, err := GetMasterConnection(ctx, connInfo, "unlock_reference_relation")
+		if err != nil {
+			return fmt.Errorf("can't lock relation \"%s\": %s", relation.QualifiedName().String(), err)
+		}
+		defer func() {
+			_ = shardConn.Close(ctx)
+		}()
+		if err = unlockReferenceRelationOnShard(ctx, shardConn, relation.QualifiedName()); err != nil {
+			return fmt.Errorf("can't lock relation \"%s\": %s", relation.QualifiedName().String(), err)
+		}
+	}
+	return nil
+}
+
+func unlockReferenceRelationOnShard(ctx context.Context, shardConn *pgx.Conn, relation *rfqn.RelationFQN) error {
+	tx, err := shardConn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, "DELETE FROM spqr_metadata.spqr_reference_relations WHERE reloid = ($1)::regclass::oid;", relation.String()); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, "DELETE FROM spqr_metadata.spqr_global_settings WHERE name=$1", spqrguardReferenceRelationLock); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// copyData performs physical key-range move from one datashard to another.
+//
+// It is assumed that the passed key range is already locked on every online spqr-router.
+// The function performs the following steps:
+//   - Create a postgres_fdw on the receiving shard.
+//   - Copy data from the sending shard to the receiving shard via fdw.
+//
+// Parameters:
+// - ctx (context.Context): The context for the function.
+// - from, to (*pgx.Conn): The connections to the sending and receiving shards.
+// - fromId, toId (string): the IDs of the sending and receiving shards.
+// - krg (*kr.KeyRange): the KeyRange object representing the key range being moved.
+// - ds (*distributions.Distribution): the Distributions object representing the distribution of data.
+// - upperBound (kr.KeyRangeBound): the upper bound of the key range being moved.
+//
+// Returns:
+// - error: an error if the move fails.
+func copyData(ctx context.Context, from, to *pgx.Conn, fromShardId, toShardId string, krg *kr.KeyRange, ds *distributions.Distribution, upperBound kr.KeyRangeBound) error {
+	schemas := make(map[string]struct{})
+	for _, rel := range ds.ListRelations() {
+		schemas[rel.Relation.GetSchema()] = struct{}{}
+	}
+	if err := SetupFDW(ctx, to, fromShardId, toShardId, schemas); err != nil {
+		spqrlog.Zero.Error().Err(err).Msg("failed to setup move data FDW")
+		return err
+	}
+	fromShard := shards.ShardsData[fromShardId]
+	toShard := shards.ShardsData[toShardId]
+	dbName := fromShard.DB
+	fromHost, err := GetMasterHost(ctx, fromShard)
+	if err != nil {
+		return err
+	}
+	hasher := murmur3.New64()
+	if _, err := hasher.Write(fmt.Appendf(nil, "%s_%s_%s_%s_%s", toShardId, strings.Split(toShard.Hosts[0], ":")[0], dbName, fromShardId, fromHost)); err != nil {
+		return err
+	}
+	serverNameHash := hasher.Sum64()
+	serverName := fmt.Sprintf("spqr_transfer_server_%x", serverNameHash)
+	tx, err := to.Begin(ctx)
+	if err != nil {
+		return spqrerror.Newf(spqrerror.SPQR_TRANSFER_ERROR, "could not move the data: could not start transaction on destination shard: %s", err)
+	}
+	if _, err := tx.Exec(ctx, "SET CONSTRAINTS ALL DEFERRED"); err != nil {
+		return spqrerror.Newf(spqrerror.SPQR_TRANSFER_ERROR, "could not move the data: error deferring constraints: %s", err)
+	}
+	if config.CoordinatorConfig().DataMoveDisableTriggers {
+		if _, err := tx.Exec(ctx, "SET session_replication_role = replica"); err != nil {
+			return fmt.Errorf("failed to disable triggers: %s", err)
+		}
+	}
+
+	if config.CoordinatorConfig().EnableICP {
+		if err := icp.CheckControlPoint(nil, icp.CopyDataCP); err != nil {
+			spqrlog.Zero.Info().Str("cp", icp.CopyDataCP).Err(err).Msg("error while checking control point")
+		}
+	}
+
+	for _, rel := range ds.ListRelations() {
+		krCondition, err := kr.GetKRCondition(rel, krg, upperBound, "")
+		if err != nil {
+			return err
+		}
+		// check that relation exists on sending shard and there is data to copy. If not, skip the relation
+
+		fromTableExists, err := CheckTableExists(ctx, from, rel.Relation)
+		if err != nil {
+			return err
+		}
+		if !fromTableExists {
+			continue
+		}
+
+		relFullName := rel.QualifiedName().String()
+		fromCount, err := getEntriesCount(ctx, from, relFullName, krCondition)
+		if err != nil {
+			return err
+		}
+		// check that relation exists on receiving shard. If not, exit
+		toTableExists, err := CheckTableExists(ctx, tx, rel.Relation)
+		if err != nil {
+			return err
+		}
+		if !toTableExists {
+			return fmt.Errorf("relation %s does not exist on receiving shard", rel.Relation)
+		}
+		toCount, err := getEntriesCount(ctx, tx, relFullName, krCondition)
+		if err != nil {
+			return err
+		}
+		// if data is already copied, skip
+		if toCount == fromCount {
+			continue
+		}
+		// if data is inconsistent, fail
+		if toCount > 0 && fromCount != 0 {
+			return fmt.Errorf("key count on sender & receiver mismatch")
+		}
+		cols, err := getTableColumns(ctx, tx, *rel.Relation)
+		if err != nil {
+			return err
+		}
+		colNames := strings.Join(cols, ", ")
+		query := fmt.Sprintf(`
+					INSERT INTO %s (%s)
+					SELECT %s FROM %s
+					WHERE %s
+					FOR UPDATE
+`, relFullName, colNames, colNames, fmt.Sprintf("%s_%s.%q", serverName, rel.Relation.GetSchema(), strings.ToLower(rel.Relation.RelationName)), krCondition)
+		_, err = tx.Exec(ctx, query)
+		if err != nil {
+			return spqrerror.Newf(spqrerror.SPQR_TRANSFER_ERROR, "could not move the data: %s", err)
+		}
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return spqrerror.Newf(spqrerror.SPQR_TRANSFER_ERROR, "could not move the data: could not execute transaction: %s", err)
+	}
+	return nil
+}
+
+func copyReferenceRelationData(ctx context.Context, from, to *pgx.Conn, fromId, toId string, rel *rrelation.ReferenceRelation) error {
+
+	schemas := make(map[string]struct{})
+	schemas[rel.QualifiedName().GetSchema()] = struct{}{}
+
+	if err := SetupFDW(ctx, to, fromId, toId, schemas); err != nil {
+		spqrlog.Zero.Error().Err(err).Msg("failed to setup move data FDW")
+		return err
+	}
+	fromShard := shards.ShardsData[fromId]
+	toShard := shards.ShardsData[toId]
+	dbName := fromShard.DB
+	fromHost, err := GetMasterHost(ctx, fromShard)
+	if err != nil {
+		return err
+	}
+	hasher := murmur3.New64()
+	if _, err := hasher.Write(fmt.Appendf(nil, "%s_%s_%s_%s_%s", toId, strings.Split(toShard.Hosts[0], ":")[0], dbName, fromId, fromHost)); err != nil {
+		return err
+	}
+	serverNameHash := hasher.Sum64()
+	serverName := fmt.Sprintf("spqr_transfer_server_%x", serverNameHash)
+
+	// check that relation exists on sending shard and there is data to copy. If not, skip the relation
+	// TODO get actual schema
+	fromTableExists, err := CheckTableExists(ctx, from, rel.RelationName)
+	if err != nil {
+		return err
+	}
+	if !fromTableExists {
+		return nil
+	}
+	relFullName := rel.QualifiedName().String()
+	fromCount, err := getEntriesCount(ctx, from, relFullName, "true")
+	if err != nil {
+		return err
+	}
+	// check that relation exists on receiving shard. If not, exit
+	toTableExists, err := CheckTableExists(ctx, to, rel.RelationName)
+	if err != nil {
+		return err
+	}
+	if !toTableExists {
+		return fmt.Errorf("relation %s does not exist on receiving shard", rel.QualifiedName())
+	}
+	toCount, err := getEntriesCount(ctx, to, relFullName, "true")
+	if err != nil {
+		return err
+	}
+	// if data is already copied, skip
+	if toCount == fromCount {
+		return nil
+	}
+	// if data is inconsistent, fail
+	if toCount > 0 && fromCount != 0 {
+		return fmt.Errorf("key count on sender & receiver mismatch")
+	}
+	tx, err := to.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("could not start transaction to copy reference table data: %s", err)
+	}
+
+	cols, err := getTableColumns(ctx, tx, *rel.RelationName)
+	if err != nil {
+		return err
+	}
+	query := fmt.Sprintf(`
+					INSERT INTO %s (%s)
+					SELECT %s FROM %s
+`, relFullName, strings.Join(cols, ", "), strings.Join(cols, ", "), fmt.Sprintf("%s_%s.%q", serverName, rel.RelationName.GetSchema(), strings.ToLower(rel.RelationName.RelationName)))
+	_, err = tx.Exec(ctx, query)
+	if err != nil {
+		return spqrerror.Newf(spqrerror.SPQR_TRANSFER_ERROR, "could not move the data: %s", err)
+	}
+	err = tx.Commit(ctx)
+	if err != nil {
+		return fmt.Errorf("could not commit transaction: %s", err)
+	}
+
+	return nil
+}
+
+func getTableColumns(ctx context.Context, db Queryable, rfqn rfqn.RelationFQN) ([]string, error) {
+	cols := make([]string, 0)
+	colRows, err := db.Query(ctx, `
+	SELECT
+		column_name 
+	FROM
+		information_schema.columns
+	WHERE table_schema = $1 AND table_name = $2`,
+		rfqn.GetSchema(), strings.ToLower(rfqn.RelationName))
+	if err != nil {
+		return nil, fmt.Errorf("failed to get columns of table \"%s\": %s", rfqn.String(), err)
+	}
+	for colRows.Next() {
+		colName := ""
+		if err := colRows.Scan(&colName); err != nil {
+			return nil, fmt.Errorf("error scanning column name: %s", err)
+		}
+		cols = append(cols, colName)
+	}
+	if len(cols) == 0 {
+		/* Is that expected? */
+		return nil, fmt.Errorf("failed to fetch relation columns")
+	}
+	return cols, nil
+}
+
+func awaitPIDs(ctx context.Context, conn *pgx.Conn) error {
+	if _, err := conn.Exec(ctx, getAwaitPIDsQuery()); err != nil {
+		return err
+	}
+	return nil
+}
+
+type Queryable interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// CheckTableExists checks if a table exists in the database.
+//
+// Parameters:
+// - ctx (context.Context): The context for the function.
+// - conn (*pgx.Conn): the database connection.
+// - relName (string): the name of the table to check.
+// - schema (string): the schema of the table to check.
+//
+// Returns:
+// - bool: true if the table exists, false otherwise.
+// - error: an error if there was a problem executing the query.
+func CheckTableExists(ctx context.Context, tx Queryable, relation *rfqn.RelationFQN) (bool, error) {
+	res := tx.QueryRow(ctx, fmt.Sprintf(`
+	SELECT 
+		count(*) > 0 as table_exists
+	FROM information_schema.tables
+	WHERE table_name = '%s' AND table_schema = '%s'`, strings.ToLower(relation.RelationName), strings.ToLower(relation.GetSchema())))
+	exists := false
+	if err := res.Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
+// CheckColumnExists checks if specified column exists in a relation.
+//
+// Parameters:
+// - ctx (context.Context): the context for database operations;
+// - conn (*pgx.Conn): the connection to the database;
+// - relName (string): the name of the table to check;
+// - schema (string): the schema of the table to check;
+// - colName (string): the name of the column to check.
+//
+// Returns:
+// - bool: true if the column exists, false otherwise;
+// - error: an error if there was a problem executing the query.
+func CheckColumnExists(ctx context.Context, conn *pgx.Conn, relation *rfqn.RelationFQN, colName string) (bool, error) {
+	res := conn.QueryRow(ctx, checkColumnExistsQuery(relation, colName))
+	exists := false
+	if err := res.Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
+// CheckConstraints checks for non-deferrable constraints or constraints referencing external relations.
+//
+// Parameters:
+// - ctx (context.Context): the context for database operations;
+// - conn (*pgx.Conn): the connection to the database;
+// - dsRels (string): the list of distributed relations, for which to check for constraints;
+// - rpRels (string): the list of replicated relations, which can also be referred to by distributed relations;
+//
+// Returns:
+// - bool: true if no such constraints are found, false otherwise;
+// - string: name of a constraint, if found;
+// - error: an error if there was a problem executing the query.
+func CheckConstraints(ctx context.Context, conn *pgx.Conn, dsRels []string, rpRels []string) (bool, string, error) {
+	if len(dsRels) == 0 {
+		return true, "", nil
+	}
+	dsRelOidList := make([]string, len(dsRels))
+	for i, relName := range dsRels {
+		dsRelOidList[i] = fmt.Sprintf("'%s'::regclass::oid", relName)
+	}
+	dsRelOids := strings.Join(dsRelOidList, ", ")
+	rpRelsClause := ""
+	if len(rpRels) > 0 {
+		refRelOidList := make([]string, len(rpRels))
+		for i, relName := range rpRels {
+			refRelOidList[i] = fmt.Sprintf("'%s'::regclass::oid", relName)
+		}
+		rpRelOids := strings.Join(refRelOidList, ", ")
+		rpRelsClause = fmt.Sprintf(" and not (confrelid IN (%s))", rpRelOids)
+	}
+	rows, err := conn.Query(ctx, checkConstraintsQuery(dsRelOids, rpRelsClause))
+	if err != nil {
+		return false, "", err
+	}
+	if !rows.Next() {
+		return true, "", nil
+	}
+	var conName string
+	if err = rows.Scan(&conName); err != nil {
+		return false, "", err
+	}
+	return false, conName, nil
+}
+
+// getEntriesCount retrieves the number of entries from a database table based on the provided condition.
+//
+// Parameters:
+// - ctx (context.Context): The context for the function.
+// - conn (*pgx.Conn): the database connection.
+// - relName (string): the name of the table to query.
+// - condition (string): the condition to apply in the query.
+//
+// Returns:
+// - int: the count of entries in the table.
+// - error: an error if there was a problem executing the query.
+func getEntriesCount(ctx context.Context, conn Queryable, relName string, condition string) (int, error) {
+	res := conn.QueryRow(ctx, fmt.Sprintf(`SELECT count(*) FROM %s WHERE %s`, relName, condition))
+	count := 0
+	if err := res.Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func TraverseShards(ctx context.Context, cb func(ctx context.Context, conn *pgx.Conn) error) error {
+	if shards == nil {
+		err := LoadConfig(config.CoordinatorConfig().ShardDataCfg)
+		if err != nil {
+			spqrlog.Zero.Error().Err(err).Msg("error loading config")
+		}
+	}
+	for id, shard := range shards.ShardsData {
+		conn, err := retry.DoValue(ctx, retry.WithMaxRetries(10, retry.NewConstant(time.Second)), func(ctx context.Context) (*pgx.Conn, error) {
+			return GetMasterConnection(ctx, shard, "traverse_shards")
+		})
+		if err != nil {
+			return err
+		}
+		if err := retry.Do(ctx, retry.WithMaxRetries(10, retry.NewConstant(time.Second)), func(ctx context.Context) error { return cb(ctx, conn) }); err != nil {
+			spqrlog.Zero.Error().Str("shard id", id).Err(err).Msg("error in traverse shards")
+			return err
+		}
+	}
+	return nil
+}
+
+func SetUpSPQRGuard(relations []*rfqn.RelationFQN) func(context.Context, *pgx.Conn) error {
+	return func(ctx context.Context, conn *pgx.Conn) error {
+		if hasSPQRGuard, err := shard.CheckExtension(ctx, conn, "spqrguard", "2.2"); err != nil {
+			return err
+		} else if !hasSPQRGuard {
+			// TODO: should we return error?
+			spqrlog.Zero.Error().Str("host", conn.Config().Host).Msg("cannot setup spqrguard on shard: extension not present")
+			return nil
+		}
+		tx, err := conn.Begin(ctx)
+		if err != nil {
+			return nil
+		}
+		defer func() {
+			err := tx.Rollback(ctx)
+			if err != nil {
+				spqrlog.Zero.Err(err).Msg("failed to rollback spqrguard transaction")
+			}
+		}()
+
+		for _, rel := range relations {
+			row := tx.QueryRow(ctx, fmt.Sprintf("SELECT count(*) > 0 as table_exists FROM spqr_metadata.spqr_distributed_relations WHERE reloid = '%s'::regclass::oid;", rel.String()))
+			exists := false
+			if err := row.Scan(&exists); err != nil {
+				return err
+			}
+			if !exists {
+				if _, err := tx.Exec(ctx, fmt.Sprintf("SELECT spqr_metadata.mark_distributed_relation('%s')", rel.String())); err != nil {
+					return err
+				}
+			}
+		}
+
+		if config.CoordinatorConfig().ForbidDirectShardQueries {
+			if _, err = tx.Exec(ctx, "LOCK TABLE spqr_metadata.spqr_global_settings IN ACCESS EXCLUSIVE MODE"); err != nil {
+				return err
+			}
+
+			if _, err := tx.Exec(ctx, fmt.Sprintf("INSERT INTO spqr_metadata.spqr_global_settings (name, enabled) VALUES (%d, true);", spqrguardDistributedRelationsLock)); err != nil {
+				return err
+			}
+		}
+
+		err = tx.Commit(ctx)
+		if err != nil {
+			return retry.RetryableError(err)
+		}
+		return nil
+	}
+}

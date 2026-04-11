@@ -1,0 +1,6 @@
+SHOW version;
+ spqr_version  
+---------------
+ devel-0-devel
+(1 row)
+

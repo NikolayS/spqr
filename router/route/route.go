@@ -1,0 +1,165 @@
+package route
+
+import (
+	"sync"
+	"time"
+
+	"github.com/pg-sharding/spqr/pkg/client"
+	"github.com/pg-sharding/spqr/pkg/config"
+	"github.com/pg-sharding/spqr/pkg/models/kr"
+	"github.com/pg-sharding/spqr/pkg/pool"
+	"github.com/pg-sharding/spqr/pkg/shard"
+	"github.com/pg-sharding/spqr/pkg/spqrlog"
+	"github.com/pg-sharding/spqr/pkg/startup"
+	"github.com/pg-sharding/spqr/pkg/tsa"
+)
+
+type Key struct {
+	user string
+	db   string
+}
+
+func (r *Key) Usr() string {
+	return r.user
+}
+
+func (r *Key) DB() string {
+	return r.db
+}
+
+func NewRouteKey(user, db string) *Key {
+	return &Key{
+		user: user,
+		db:   db,
+	}
+}
+
+func (r *Key) String() string {
+	return r.db + " " + r.user
+}
+
+type Route struct {
+	pool.PoolIterator
+
+	beRule *config.BackendRule
+	frRule *config.FrontendRule
+
+	clPool     client.Pool
+	mShardPool pool.MultiShardTSAPool
+
+	mu sync.Mutex
+	// protects this
+	cachedParams bool
+	params       shard.ParameterSet
+}
+
+func NewRoute(beRule *config.BackendRule,
+	frRule *config.FrontendRule,
+	mapping map[string]*config.Shard,
+	clientDeadCheckInterval time.Duration,
+) *Route {
+	sp := &startup.StartupParams{}
+	if frRule != nil {
+		sp.SearchPath = frRule.SearchPath
+	}
+
+	var preferAZ string
+	if config.RouterConfig().PreferSameAvailabilityZone {
+		preferAZ = config.RouterConfig().AvailabilityZone
+	}
+
+	route := &Route{
+		beRule: beRule,
+		frRule: frRule,
+		clPool: client.NewClientPool(clientDeadCheckInterval),
+		params: shard.ParameterSet{},
+	}
+
+	/* NewRoute can be called from coordinator console, which does not need to allocate actual backend */
+	if beRule != nil {
+		hostCheckInterval := config.ValueOrDefaultDuration(config.RouterConfig().DbpoolCheckInterval, pool.DefaultCheckInterval)
+		hostCheckTTL := config.ValueOrDefaultDuration(config.RouterConfig().DbpoolCacheTTL, pool.DefaultCacheTTL)
+
+		route.mShardPool = pool.NewDBPool(mapping, sp, preferAZ, hostCheckTTL, hostCheckInterval)
+
+		route.mShardPool.SetRule(beRule)
+	}
+
+	return route
+}
+
+// TODO : unit tests
+func (r *Route) SetParams(ps shard.ParameterSet) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cachedParams = true
+	r.params = ps
+}
+
+// TODO : unit tests
+func (r *Route) Params() (shard.ParameterSet, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.cachedParams {
+		return r.params, nil
+	}
+
+	var anyK kr.ShardKey
+	for k := range r.mShardPool.ShardMapping() {
+		anyK.Name = k
+		break
+	}
+
+	// maxuint64
+	serv, err := r.mShardPool.ConnectionWithTSA(0xFFFFFFFFFFFFFFFF, anyK, tsa.TSA(config.TargetSessionAttrsAny))
+	if err != nil {
+		spqrlog.Zero.Error().Err(err).Msg("")
+		return shard.ParameterSet{}, err
+	}
+
+	r.cachedParams = true
+	r.params = serv.Params()
+
+	if err := r.mShardPool.Put(serv); err != nil {
+		return nil, err
+	}
+
+	return r.params, nil
+}
+
+func (r *Route) MultiShardPool() pool.MultiShardTSAPool {
+	return r.mShardPool
+}
+
+func (r *Route) ClientPool() client.Pool {
+	return r.clPool
+}
+
+func (r *Route) BeRule() *config.BackendRule {
+	return r.beRule
+}
+
+func (r *Route) FrRule() *config.FrontendRule {
+	return r.frRule
+}
+
+func (r *Route) NotifyClients(cb func(cl client.ClientInfo) error) error {
+	return r.clPool.ClientPoolForeach(cb)
+}
+
+func (r *Route) ErrorCounts() map[string]uint64 {
+	return r.clPool.ErrorCounts()
+}
+
+func (r *Route) AddClient(cl client.Client) error {
+	return r.clPool.Put(cl)
+}
+
+func (r *Route) ReleaseClient(clientID uint) (bool, error) {
+	return r.clPool.Pop(clientID)
+}
+
+func (r *Route) ForEachPool(cb func(pool.Pool) error) error {
+	return r.mShardPool.ForEachPool(cb)
+}

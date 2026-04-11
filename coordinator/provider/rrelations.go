@@ -1,0 +1,43 @@
+package provider
+
+import (
+	"context"
+
+	"github.com/pg-sharding/spqr/coordinator"
+	protos "github.com/pg-sharding/spqr/pkg/protos"
+	"github.com/pg-sharding/spqr/router/rfqn"
+	"google.golang.org/protobuf/types/known/emptypb"
+
+	rrelations "github.com/pg-sharding/spqr/pkg/models/rrelation"
+)
+
+type ReferenceRelationServer struct {
+	protos.UnimplementedReferenceRelationsServiceServer
+
+	impl coordinator.Coordinator
+}
+
+func NewReferenceRelationServer(impl coordinator.Coordinator) *ReferenceRelationServer {
+	return &ReferenceRelationServer{
+		impl: impl,
+	}
+}
+
+func (rr *ReferenceRelationServer) CreateReferenceRelations(ctx context.Context, req *protos.CreateReferenceRelationsRequest) (*emptypb.Empty, error) {
+	return nil, rr.impl.CreateReferenceRelation(ctx,
+		rrelations.RefRelationFromProto(req.Relation),
+		rrelations.AutoIncrementEntriesFromProto(req.Entries))
+}
+
+func (rr *ReferenceRelationServer) DropReferenceRelations(ctx context.Context, req *protos.DropReferenceRelationsRequest) (*emptypb.Empty, error) {
+	for _, qualName := range req.GetRelations() {
+		if err := rr.impl.DropReferenceRelation(ctx, rfqn.RelationFQNFromProto(qualName)); err != nil {
+			return nil, err
+		}
+	}
+	return nil, nil
+}
+
+func (rr *ReferenceRelationServer) AlterReferenceRelationStorageAdvanced(ctx context.Context, req *protos.AlterReferenceRelationStorageRequest) (*emptypb.Empty, error) {
+	return nil, rr.impl.AlterReferenceRelationStorage(ctx, rfqn.RelationFQNFromProto(req.Relation), req.ShardIds)
+}

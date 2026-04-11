@@ -1,0 +1,105 @@
+REGISTER ROUTER r1 ADDRESS "[regress_router]:7000";
+          register router           
+------------------------------------
+ router -> r1-[regress_router]:7000
+(1 row)
+
+CREATE DISTRIBUTION ds1 COLUMN TYPES integer;
+    add distribution    
+------------------------
+ distribution id -> ds1
+(1 row)
+
+CREATE KEY RANGE krid1 FROM 1 ROUTE TO sh1 FOR DISTRIBUTION ds1;
+ add key range 
+---------------
+ bound -> 1
+(1 row)
+
+SHOW key_ranges;
+ key_range_id | shard_id | distribution_id | lower_bound | locked 
+--------------+----------+-----------------+-------------+--------
+ krid1        | sh1      | ds1             | 1           | false
+(1 row)
+
+REDISTRIBUTE KEY RANGE krid1 TO sh1 BATCH SIZE 100;
+    redistribute key range     
+-------------------------------
+ key range id         -> krid1
+ destination shard id -> sh1
+ batch size           -> 100
+(3 rows)
+
+SHOW key_ranges;
+ key_range_id | shard_id | distribution_id | lower_bound | locked 
+--------------+----------+-----------------+-------------+--------
+ krid1        | sh1      | ds1             | 1           | false
+(1 row)
+
+REDISTRIBUTE KEY RANGE krid1 TO sh2 BATCH SIZE 100;
+    redistribute key range     
+-------------------------------
+ key range id         -> krid1
+ destination shard id -> sh2
+ batch size           -> 100
+(3 rows)
+
+SHOW key_ranges;
+ key_range_id | shard_id | distribution_id | lower_bound | locked 
+--------------+----------+-----------------+-------------+--------
+ krid1        | sh2      | ds1             | 1           | false
+(1 row)
+
+REDISTRIBUTE KEY RANGE krid1 TO sh1 BATCH SIZE -1;
+ERROR:  failed to parse query "REDISTRIBUTE KEY RANGE krid1 TO sh1 BATCH SIZE -1;": syntax error
+REDISTRIBUTE KEY RANGE krid1 TO sh2;
+    redistribute key range     
+-------------------------------
+ key range id         -> krid1
+ destination shard id -> sh2
+ batch size           -> 500
+(3 rows)
+
+SHOW key_ranges;
+ key_range_id | shard_id | distribution_id | lower_bound | locked 
+--------------+----------+-----------------+-------------+--------
+ krid1        | sh2      | ds1             | 1           | false
+(1 row)
+
+RETRY MOVE TASK GROUP tgid;
+ Task group ID | Destination shard ID | Source key range ID | Destination key range ID 
+---------------+----------------------+---------------------+--------------------------
+(0 rows)
+
+RETRY TASK GROUP tgid;
+ Task group ID | Destination shard ID | Source key range ID | Destination key range ID 
+---------------+----------------------+---------------------+--------------------------
+(0 rows)
+
+STOP MOVE TASK GROUP tgid;
+ Move task group ID 
+--------------------
+(0 rows)
+
+STOP TASK GROUP tgid;
+ Move task group ID 
+--------------------
+(0 rows)
+
+STOP TASK GROUP ALL;
+ Move task group ID 
+--------------------
+(0 rows)
+
+DROP DISTRIBUTION ALL CASCADE;
+ distribution_id 
+-----------------
+ ds1
+(1 row)
+
+UNREGISTER ROUTER ALL;
+ unregister router 
+-------------------
+ router id -> *
+(1 row)
+

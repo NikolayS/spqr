@@ -1,0 +1,25 @@
+---
+title: 'Concepts'
+description: 'Some SPQR Admin Console terms'
+---
+
+
+## Distribution
+
+Distribution is a sort of container for all the settings. With distribution, you can shard a part of your database with one logic, and other part is another logic. You may think of distribution like a virtual database.
+
+
+## Key Range
+
+A key range refers to a range of keys that are used to partition and distribute data across multiple shards. Each key in the range is associated with a specific shard.
+
+You can lookup registered key ranges using command "show key_ranges".
+```sql
+show key_ranges;
+ key_range_id | shard_id | distribution_id | lower_bound | locked
+--------------+----------+-----------------+-------------+--------
+ kr1          | sh1      | ds1             | 10          | true
+ kr2          | sh1      | ds1             | 5           | false
+(2 rows)
+
+```

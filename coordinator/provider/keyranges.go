@@ -2,56 +2,216 @@ package provider
 
 import (
 	"context"
+	"fmt"
+
+	"github.com/pg-sharding/spqr/pkg/models/tasks"
+
+	"github.com/pg-sharding/spqr/pkg/models/spqrerror"
+	"google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/pg-sharding/spqr/coordinator"
-	shards "github.com/pg-sharding/spqr/router/protos"
+	"github.com/pg-sharding/spqr/pkg/models/kr"
+	protos "github.com/pg-sharding/spqr/pkg/protos"
 )
 
-type KeyRangeService struct {
-	shards.UnimplementedKeyRangeServiceServer
+type CoordinatorService struct {
+	protos.UnimplementedKeyRangeServiceServer
 
 	impl coordinator.Coordinator
 }
 
-func (c KeyRangeService) LockKeyRange(ctx context.Context, request *shards.LockKeyRangeRequest) (*shards.LockKeyRangeReply, error) {
-	err := c.impl.Lock(request.Krid)
-	return nil, err
-}
-
-func (c KeyRangeService) UnlockKeyRange(ctx context.Context, request *shards.UnlockKeyRangeRequest) (*shards.UnlockKeyRangeReply, error) {
-	err := c.impl.UnLock(request.Krid)
-	return nil, err
-}
-func (c KeyRangeService) SplitKeyRange(ctx context.Context, request *shards.SplitKeyRangeRequest) (*shards.SplitKeyRangeReply, error) {
-	panic("implement me")
-}
-
-func (c KeyRangeService) AddShardingColumn(ctx context.Context, request *shards.AddShardingColumnRequest) (*shards.AddShardingColumnReply, error) {
-	panic("implement me")
-}
-
-func (c KeyRangeService) AddLocalTable(ctx context.Context, request *shards.AddLocalTableRequest) (*shards.AddLocalTableReply, error) {
-	panic("implement me")
-}
-
-func (c KeyRangeService) ListKeyRange(ctx context.Context, request *shards.ListKeyRangeRequest) (*shards.KeyRangeReply, error) {
-
-	krs := []*shards.KeyRange{
-		{
-			Krid:    "1",
-			ShardId: "2",
-		},
+// DropAllKeyRanges implements proto.KeyRangeServiceServer.
+func (c *CoordinatorService) DropAllKeyRanges(ctx context.Context, request *emptypb.Empty) (*protos.DropAllKeyRangesResponse, error) {
+	err := c.impl.DropKeyRangeAll(ctx)
+	if err != nil {
+		return nil, err
 	}
 
-	return &shards.KeyRangeReply{
-		KeyRanges: krs,
+	return &protos.DropAllKeyRangesResponse{}, nil
+}
+
+// DEPRECATED
+func (c *CoordinatorService) DropKeyRange(ctx context.Context, request *protos.DropKeyRangeRequest) (*protos.ModifyReply, error) {
+	return nil, fmt.Errorf("DEPRECATED (CreateKeyRange in CoordinatorService). Use ExecuteNoTran or CommitTran")
+}
+
+// DEPRECATED
+func (c *CoordinatorService) CreateKeyRange(ctx context.Context, request *protos.CreateKeyRangeRequest) (*protos.ModifyReply, error) {
+	return nil, fmt.Errorf("DEPRECATED (CreateKeyRange in CoordinatorService). Use ExecuteNoTran or CommitTran")
+}
+
+// TODO : unit tests
+func (c *CoordinatorService) LockKeyRange(ctx context.Context, request *protos.LockKeyRangeRequest) (*protos.ModifyReply, error) {
+	for _, id := range request.Id {
+		_, err := c.impl.LockKeyRange(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &protos.ModifyReply{}, nil
+}
+
+func (c *CoordinatorService) UnlockKeyRange(ctx context.Context, request *protos.UnlockKeyRangeRequest) (*protos.ModifyReply, error) {
+	for _, id := range request.Id {
+		if err := c.impl.UnlockKeyRange(ctx, id); err != nil {
+			return nil, err
+		}
+	}
+	return &protos.ModifyReply{}, nil
+}
+
+// TODO : unit tests
+func (c *CoordinatorService) SplitKeyRange(ctx context.Context, request *protos.SplitKeyRangeRequest) (*protos.ModifyReply, error) {
+	splitKR := &kr.SplitKeyRange{
+		Bound:     [][]byte{request.Bound}, // fix multidim case
+		Krid:      request.NewId,
+		SourceID:  request.SourceId,
+		SplitLeft: request.SplitLeft,
+	}
+
+	if err := c.impl.Split(ctx, splitKR); err != nil {
+		return nil, err
+	}
+
+	return &protos.ModifyReply{}, nil
+}
+
+// GetKeyRange gets key ranges with given ids
+// TODO unit tests
+func (c *CoordinatorService) GetKeyRange(ctx context.Context, request *protos.GetKeyRangeRequest) (*protos.KeyRangeReply, error) {
+	res := make([]*protos.KeyRangeInfo, 0)
+	for _, id := range request.Ids {
+		krg, err := c.impl.GetKeyRange(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if krg != nil {
+			res = append(res, krg.ToProto())
+		}
+	}
+	return &protos.KeyRangeReply{KeyRangesInfo: res}, nil
+}
+
+// TODO : unit tests
+func (c *CoordinatorService) ListKeyRange(ctx context.Context, request *protos.ListKeyRangeRequest) (*protos.KeyRangeReply, error) {
+
+	krsqb, err := c.impl.ListKeyRanges(ctx, request.Distribution)
+	if err != nil {
+		return nil, err
+	}
+
+	var krs []*protos.KeyRangeInfo
+
+	for _, keyRange := range krsqb {
+		krs = append(krs, keyRange.ToProto())
+	}
+
+	return &protos.KeyRangeReply{
+		KeyRangesInfo: krs,
 	}, nil
 }
 
-var _ shards.KeyRangeServiceServer = KeyRangeService{}
+func (c *CoordinatorService) ListAllKeyRanges(ctx context.Context, _ *emptypb.Empty) (*protos.KeyRangeReply, error) {
+	krsDb, err := c.impl.ListAllKeyRanges(ctx)
+	if err != nil {
+		return nil, err
+	}
 
-func NewKeyRangeService(impl coordinator.Coordinator) shards.KeyRangeServiceServer {
-	return &KeyRangeService{
+	krs := make([]*protos.KeyRangeInfo, len(krsDb))
+
+	for i, krg := range krsDb {
+		krs[i] = krg.ToProto()
+	}
+
+	return &protos.KeyRangeReply{KeyRangesInfo: krs}, nil
+}
+
+func (c *CoordinatorService) ListKeyRangeLocks(ctx context.Context, _ *emptypb.Empty) (*protos.KeyRangeLocksReply, error) {
+	krLocks, err := c.impl.ListKeyRangeLocks(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return &protos.KeyRangeLocksReply{KeyRangesLocks: krLocks}, nil
+}
+
+// TODO : unit tests
+func (c *CoordinatorService) MoveKeyRange(ctx context.Context, request *protos.MoveKeyRangeRequest) (*protos.ModifyReply, error) {
+	if err := c.impl.Move(ctx, &kr.MoveKeyRange{
+		Krid:    request.Id,
+		ShardId: request.ToShardId,
+	}); err != nil {
+		return nil, err
+	}
+
+	return &protos.ModifyReply{}, nil
+}
+
+// TODO : unit tests
+func (c *CoordinatorService) MergeKeyRange(ctx context.Context, request *protos.MergeKeyRangeRequest) (*protos.ModifyReply, error) {
+	if err := c.impl.Unite(ctx, &kr.UniteKeyRange{
+		BaseKeyRangeId:      request.GetBaseId(),
+		AppendageKeyRangeId: request.GetAppendageId(),
+	}); err != nil {
+		return nil, spqrerror.New(spqrerror.SPQR_KEYRANGE_ERROR, err.Error())
+	}
+
+	return &protos.ModifyReply{}, nil
+}
+
+// TODO: unit tests
+func (c *CoordinatorService) BatchMoveKeyRange(ctx context.Context, request *protos.BatchMoveKeyRangeRequest) (*emptypb.Empty, error) {
+	return nil, c.impl.BatchMoveKeyRange(ctx, &kr.BatchMoveKeyRange{
+		TaskGroupId: request.TaskGroupId,
+		KeyRangeId:  request.KeyRangeId,
+		DestKrId:    request.ToKrId,
+		ShardId:     request.ToShardId,
+		Limit: func() int64 {
+			switch request.LimitType {
+			case protos.RedistributeLimitType_RedistributeAllKeys:
+				return -1
+			case protos.RedistributeLimitType_RedistributeKeysLimit:
+				return request.Limit
+			default:
+				panic("unknown redistribution key limit")
+			}
+		}(),
+		BatchSize: int(request.BatchSize),
+		Type: func() tasks.SplitType {
+			switch request.SplitType {
+			case protos.SplitType_SplitLeft:
+				return tasks.SplitLeft
+			case protos.SplitType_SplitRight:
+				return tasks.SplitRight
+			default:
+				panic("incorrect split type")
+			}
+		}(),
+	}, tasks.TaskGroupIssuerFromProto(request.Issuer))
+}
+
+// TODO: unit tests
+func (c *CoordinatorService) RedistributeKeyRange(ctx context.Context, request *protos.RedistributeKeyRangeRequest) (*emptypb.Empty, error) {
+	return nil, c.impl.RedistributeKeyRange(ctx, &kr.RedistributeKeyRange{
+		TaskGroupId: request.TaskGroupId,
+		KrId:        request.Krid,
+		ShardId:     request.ShardId,
+		BatchSize:   int(request.BatchSize),
+		Check:       request.Check,
+		Apply:       request.Apply,
+		NoWait:      request.NoWait,
+	})
+}
+
+// TODO: unit tests
+func (c *CoordinatorService) RenameKeyRange(ctx context.Context, request *protos.RenameKeyRangeRequest) (*emptypb.Empty, error) {
+	return nil, c.impl.RenameKeyRange(ctx, request.KeyRangeId, request.NewKeyRangeId)
+}
+
+var _ protos.KeyRangeServiceServer = &CoordinatorService{}
+
+func NewKeyRangeService(impl coordinator.Coordinator) protos.KeyRangeServiceServer {
+	return &CoordinatorService{
 		impl: impl,
 	}
 }

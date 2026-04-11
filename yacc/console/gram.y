@@ -1,0 +1,1751 @@
+
+%{
+package spqrparser
+
+import (
+	"fmt"
+	"strconv"
+	"time"
+
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/binary"
+	"strings"
+	"math"
+	"github.com/pg-sharding/spqr/qdb"
+	"github.com/pg-sharding/lyx/lyx"
+	"github.com/pg-sharding/spqr/router/rfqn"
+)
+
+const SIGNED_INT_RANGE_ERROR string = "the Signed Value should be at the range of [-9223372036854775808, 9223372036854775807]."
+
+func randomHex(n int) (string, error) {
+	bytes := make([]byte, n)
+	if _, err := rand.Read(bytes); err != nil {
+	  return "", err
+	}
+	return hex.EncodeToString(bytes), nil
+}
+
+var validSslModes = map[string]bool{
+	"disable": true, "allow": true, "prefer": true,
+	"require": true, "verify-ca": true, "verify-full": true,
+}
+%}
+
+// fields inside this union end up as the fields in a structure known
+// as ${PREFIX}SymType, of which a reference is passed to the lexer.
+%union {
+	str                    string
+	strlist                []string
+	byte                   byte
+	bytes                  []byte
+	integer                int
+	uinteger               uint
+	uintegerlist           []uint
+	bool                   bool
+	empty                  struct{}
+
+    set                    *Set
+	statement              Statement
+	show                   *Show
+	help                   *Help
+
+	drop                   *Drop
+	create                 *Create
+
+	kill                   *Kill
+	lock                   *Lock
+	unlock                 *Unlock
+
+
+	krbound                *KeyRangeBound
+
+	qname		   		   *rfqn.RelationFQN
+	ds                     *DistributionDefinition
+	kr                     *KeyRangeDefinition
+	shard                  *ShardDefinition
+
+	register_router        *RegisterRouter
+	unregister_router      *UnregisterRouter
+	
+	split                  *SplitKeyRange
+	move                   *MoveKeyRange
+	unite                  *UniteKeyRange
+	
+	redistribute           *RedistributeKeyRange
+
+	invalidate             *Invalidate
+	sync_reference_tables  *SyncReferenceTables
+	alter_reference_table_storage *AlterReferenceTableStorage
+
+	shutdown               *Shutdown
+	listen                 *Listen
+
+	trace                  *TraceStmt
+	stoptrace              *StopTraceStmt
+
+	distribution           *DistributionDefinition
+
+	alter                  *Alter
+	alter_distribution     *AlterDistribution
+	distributed_relation   *DistributedRelation
+	alter_default_shard    *AlterDefaultShard
+
+	/* ICP */
+	icp						*InstanceControlPoint
+	icpAction				*ICPointAction
+	duration				time.Duration
+	
+	relations              []*DistributedRelation
+	relation               *DistributedRelation
+	dEntrieslist 	       []DistributionKeyEntry
+
+	distrKeyEntry          DistributionKeyEntry
+	aiEntry                *AutoIncrementEntry
+
+	key_range_selector     *KeyRangeSelector
+	distribution_selector  *DistributionSelector
+	aiEntrieslist          []*AutoIncrementEntry
+
+    colref                 *lyx.ColumnRef
+	colreflist			   []*lyx.ColumnRef
+    where                  lyx.Node
+	expr				   lyx.Node
+
+	order_clause 		   lyx.Node
+	opt_asc_desc		   int
+
+	group_clause		   GroupByClause
+
+	retryMoveTaskGroup     *RetryMoveTaskGroup
+	stopMoveTaskGroup      *StopMoveTaskGroup
+
+	typedColRef         	TypedColRef
+	routingExpr				[]TypedColRef
+
+	alter_relation          *AlterRelationV2
+	alter_shard             *AlterShard
+}
+
+// any non-terminal which returns a value needs a type, which is
+// really a field name in the above union struct
+//%type <val> expr number
+
+// same for terminals
+%token <str> IDENT COMMAND
+
+// DDL
+%token <str> HELP SHOW KILL
+
+// SQL
+%token <str> WHERE OR AND
+
+%type< where> where_clause
+%type<expr> AexprConst a_expr c_expr
+
+// '='
+%token<str> TEQ
+// ','
+%token<str> TCOMMA
+// '.'
+%token<str> TDOT
+
+/* any const */
+%token<str> SCONST
+
+%token<uinteger> ICONST
+%token<uinteger> INVALID_ICONST
+
+
+%type<bytes> key_range_bound_elem
+
+%type<krbound>  key_range_bound
+
+// ';'
+%token<str> TSEMICOLON
+// '-'
+%token<str> TMINUS
+// '+'
+%token<str> TPLUS
+// '*'
+%token<str> TMUL
+
+// '<' '>'
+%token<str> TLESS TGREATER 
+
+
+// '(' & ')', '[' & ']'
+%token<str> TOPENBR TCLOSEBR TOPENSQBR  TCLOSESQBR
+
+%token<str> NOT
+
+%type<colref> ColRef
+%type<colreflist> ColRef_list
+
+%type<str> any_val any_id shard_id
+
+%type<uinteger> any_uint
+// CMDS
+%type <statement> command
+
+// routers
+%token <str> SHUTDOWN LISTEN REGISTER UNREGISTER ROUTER ROUTE
+
+%token <str> CREATE ADD DROP LOCK UNLOCK SPLIT MOVE COMPOSE SET CASCADE ATTACH ALTER DETACH REDISTRIBUTE REFERENCE CHECK APPLY UNIQUE RENAME
+%token <str> COLUMN TABLE TABLES RELATIONS BACKENDS HASH FUNCTION KEY RANGE DISTRIBUTION RELATION REPLICATED AUTO INCREMENT SEQUENCE SCHEMA INDEX STORAGE
+%token <str> SHARDS ROUTERS SHARD HOST RULE COLUMNS VERSION HOSTS SEQUENCES IS_READ_ONLY MOVE_STATS
+%token <str> BY FROM TO WITH UNITE ALL ADDRESS FOR
+%token <str> CLIENT
+%token <str> BATCH SIZE NOWAIT
+%token <str> INVALIDATE CACHE
+%token <str> SYNC
+%token <str> RETRY
+%token <str> DISTRIBUTED IN ON
+%token <str> DEFAULT
+%token <str> STALE CLIENTS
+%token <str> SSLMODE CERT_FILE KEY_FILE ROOT_CERT_FILE
+
+%token <str> IDENTITY MURMUR CITY 
+
+%token<str> START STOP TRACE MESSAGES
+
+%token<str> TASK GROUP
+
+%token<str> SYSTEM RELOAD RESTART
+
+%token<str> SECONDS WAIT PANIC SLEEP
+
+/* types */
+%token<str> VARCHAR INTEGER INT TYPES UUID TYPE
+
+/* ICP */
+%token<str> CONTROL POINT
+
+/* any operator */
+%token<str> OP
+
+
+%type<key_range_selector> key_range_stmt
+%type<distribution_selector> distribution_select_stmt
+
+%type <str> show_statement_type
+%type <str> kill_statement_type
+
+%type <show> show_stmt
+%type <help> help_stmt
+%type <str> help_command_name help_word
+%type <kill> kill_stmt
+
+%type <drop> drop_stmt
+%type <create> add_stmt create_stmt
+
+%type <trace> trace_stmt
+%type <stoptrace> stoptrace_stmt
+
+%type<qname> qualified_name
+%type <ds> distribution_define_stmt
+%type <kr> key_range_define_stmt
+%type <shard> shard_define_stmt
+
+%type<dEntrieslist> distribution_key_argument_list
+%type<aiEntrieslist> opt_auto_increment
+%type<aiEntrieslist> auto_inc_argument_list
+%type<uinteger> opt_auto_increment_start_clause
+%type<distribution_selector> opt_distribution_selector
+
+%type<distrKeyEntry> distribution_key_entry routing_expr
+%type<aiEntry> auto_increment_entry
+
+%type<str> opt_hash_function_clause hash_function_clause
+%type<str> hash_function_name
+
+%type<alter> alter_stmt create_distributed_relation_stmt
+%type<alter_distribution> distribution_alter_stmt
+
+%type<icp> icp_stmt
+
+%type<invalidate> invalidate_stmt
+%type<sync_reference_tables> sync_reference_tables_stmt
+%type<alter_reference_table_storage> alter_reference_table_storage_stmt
+
+%type<relations> relation_attach_stmt
+%type<relations> distributed_relation_list_def
+
+%type<distributed_relation> distributed_relation_def
+
+%type<strlist> opt_show_columns show_columns_list
+
+%type<alter_relation> relation_alter_stmt_v2
+
+%type<strlist> col_types_list opt_col_types any_id_list opt_on_shards
+%type<str> col_types_elem
+%type<bool> opt_cascade
+%type<str> opt_default_shard
+%type<shard> opt_shard_tls
+
+%type<alter_shard> alter_shard_options
+
+%type<statement> alter_sys_target
+
+%token <str> ASC DESC ORDER
+%type <order_clause> order_clause
+%type <opt_asc_desc> opt_asc_desc
+%type <group_clause> group_clause
+%type <unlock> unlock_stmt
+%type <lock> lock_stmt
+%type <shutdown> shutdown_stmt
+%type <listen> listen_stmt
+%type <split> split_key_range_stmt
+%type <move> move_key_range_stmt
+%type <redistribute> redistribute_stmt
+%type <unite> unite_key_range_stmt
+%type <register_router> register_router_stmt
+%type <unregister_router> unregister_router_stmt
+%type <integer> opt_batch_size
+%type <str> opt_redistr_id
+
+%type <typedColRef>  typed_col_ref
+%type <routingExpr> routing_expr_column_list
+
+%type <retryMoveTaskGroup> retry_move_task_group
+%type <stopMoveTaskGroup> stop_move_task_group
+%type <bool> opt_no_wait
+
+%type<icpAction> opt_icp_action 
+%type<duration> opt_duration
+
+%left		OR
+%left		AND
+%right		NOT
+%nonassoc	TLESS TGREATER TEQ
+%left		OP OPERATOR	/* multi-character ops and user-defined operators */
+%left		TPLUS TMINUS
+%left		TMUL 
+%left		TSQOPENBR TSQCLOSEBR
+%left		TOPENBR TCLOSEBR
+
+
+%start any_command
+
+%%
+
+
+any_command:
+    command semicolon_opt
+
+semicolon_opt:
+/*empty*/ {}
+| TSEMICOLON {}
+
+
+command:
+	{
+		$$ = nil
+	}
+	|
+	add_stmt
+	{
+		setParseTree(yylex, $1)
+	}
+	| create_stmt
+	{
+		setParseTree(yylex, $1)
+	}
+	| trace_stmt
+	{
+		setParseTree(yylex, $1)
+	}
+	| stoptrace_stmt
+	{
+		setParseTree(yylex, $1)
+	}
+	| drop_stmt
+	{
+		setParseTree(yylex, $1)
+	}
+	| lock_stmt
+	{
+		setParseTree(yylex, $1)
+	}
+	| unlock_stmt
+	{
+		setParseTree(yylex, $1)
+	}
+	| show_stmt
+	{
+		setParseTree(yylex, $1)
+	}
+	| help_stmt
+	{
+		setParseTree(yylex, $1)
+	}
+	| kill_stmt
+	{
+		setParseTree(yylex, $1)
+	}
+	| listen_stmt
+	{
+		setParseTree(yylex, $1)
+	}
+	| shutdown_stmt
+	{
+		setParseTree(yylex, $1)
+	}
+	| split_key_range_stmt
+	{
+		setParseTree(yylex, $1)
+	}
+	| move_key_range_stmt
+	{
+		setParseTree(yylex, $1)
+	}
+	| redistribute_stmt
+	{
+		setParseTree(yylex, $1)
+	}
+	| unite_key_range_stmt
+	{
+	   setParseTree(yylex, $1)
+	}
+	| register_router_stmt
+	{
+		setParseTree(yylex, $1)
+	}
+	| unregister_router_stmt
+	{
+		setParseTree(yylex, $1)
+	}
+	| alter_stmt
+	{
+		setParseTree(yylex, $1)
+	}
+	| invalidate_stmt
+	{
+		setParseTree(yylex, $1)
+	} 
+	| retry_move_task_group
+	{
+		setParseTree(yylex, $1)
+	}
+	| stop_move_task_group
+	{
+		setParseTree(yylex, $1)
+	}
+	| sync_reference_tables_stmt
+	{
+		setParseTree(yylex, $1)
+	}
+	| alter_reference_table_storage_stmt
+	{
+		setParseTree(yylex, $1)
+	}
+	| create_distributed_relation_stmt
+	{
+		setParseTree(yylex, $1)
+	} | icp_stmt
+	{
+		setParseTree(yylex, $1)
+	}
+
+any_uint:
+	ICONST {
+		$$ = uint($1)
+	}
+
+any_val: SCONST
+	{
+		$$ = string($1)
+	} | 
+	IDENT
+	{
+		$$ = string($1)
+	} | ICONST {
+		if $1 > uint(math.MaxInt64) {
+			yylex.Error(SIGNED_INT_RANGE_ERROR)
+			return 1
+		} else {
+			buf := make([]byte, binary.MaxVarintLen64)
+			binary.PutVarint(buf, int64($1))
+			$$ = string(buf)
+		}
+	} | TMINUS ICONST {
+		if $2 > uint(-math.MinInt64) {
+			yylex.Error(SIGNED_INT_RANGE_ERROR)
+			return 1
+		} else {
+			buf := make([]byte, binary.MaxVarintLen64)
+			binary.PutVarint(buf, int64(-$2))
+			$$ = string(buf)
+		}
+	}
+
+any_id: IDENT
+	{
+		$$ = string($1)
+	} | SCONST
+	{
+		$$ = string($1)
+	}
+
+
+shard_id: IDENT
+	{
+		$$ = string($1)
+	} | SCONST
+	{
+		$$ = string($1)
+	}
+
+qualified_name:
+	IDENT
+	{
+		$$ = &rfqn.RelationFQN{RelationName: $1}
+	} |
+	SCONST
+	{
+		$$ = &rfqn.RelationFQN{RelationName: $1}
+	} |
+	IDENT TDOT IDENT
+	{
+		$$ = &rfqn.RelationFQN{RelationName: $3, SchemaName: $1}
+	}
+
+ColRef:
+    any_id {
+        $$ = &lyx.ColumnRef{
+            ColName: $1,
+        }
+    }
+
+ColRef_list: 
+    ColRef_list TCOMMA ColRef
+    {
+      $$ = append($1, $3)
+    } | ColRef {
+      $$ = []*lyx.ColumnRef {
+		  $1,
+	  }
+    } 
+
+
+/*
+ * Constants
+ */
+AexprConst: 
+	SCONST {
+		$$ = &lyx.AExprSConst{
+			Value: $1,
+		}
+	} |
+	ICONST {
+		$$ = &lyx.AExprSConst{
+			Value: fmt.Sprintf("%+v", $1),
+		}
+	}
+
+/*
+ * Productions that can be used in both a_expr and b_expr.
+ *
+ * Note: productions that refer recursively to a_expr or b_expr mostly
+ * cannot appear here.	However, it's OK to refer to a_exprs that occur
+ * inside parentheses, such as function arguments; that cannot introduce
+ * ambiguity to the b_expr syntax.
+ */
+c_expr:	
+			AexprConst
+				{ $$ = $1; }
+            | TOPENBR a_expr TCLOSEBR {
+                $$ = $2
+			}
+
+a_expr:		
+            c_expr									{ $$ = $1; }
+			|
+			IDENT {
+				/* column ref */
+				$$ = &lyx.ColumnRef{
+					TableAlias: "",
+					ColName: $1,
+				}
+			}
+
+		/*
+		 * These operators must be called out explicitly in order to make use
+		 * of bison's automatic operator-precedence handling.  All other
+		 * operator names are handled by the generic productions using "Op",
+		 * below; and all those operators will have the same precedence.
+		 *
+		 * If you add more explicitly-known operators, be sure to add them
+		 * also to b_expr and to the MathOp list below.
+		 */
+            |
+			 TPLUS a_expr					%prec TMINUS
+				{ $$ = $2 }
+			| TMINUS a_expr					%prec TMINUS
+					{ $$ = $2 }
+			| a_expr TPLUS a_expr
+				{
+                     $$ = &lyx.AExprOp{
+                        Left: $1,
+                        Right: $3,
+                        Op: $2,
+                    } 
+                }
+			| a_expr TMINUS a_expr
+				{
+                     $$ = &lyx.AExprOp{
+                        Left: $1,
+                        Right: $3,
+                        Op: $2,
+                    } 
+                }
+			| a_expr TMUL a_expr
+				{
+                     $$ = &lyx.AExprOp{
+                        Left: $1,
+                        Right: $3,
+                        Op: $2,
+                    } 
+                }
+			
+			| a_expr TLESS a_expr
+					{
+                     $$ = &lyx.AExprOp{
+                        Left: $1,
+                        Right: $3,
+                        Op: $2,
+                    } 
+                }
+			| a_expr TGREATER a_expr
+				{
+                     $$ = &lyx.AExprOp{
+                        Left: $1,
+                        Right: $3,
+                        Op: $2,
+                    } 
+                }
+			| a_expr TEQ a_expr					%prec OP
+				{
+                     $$ = &lyx.AExprOp{
+                        Left: $1,
+                        Right: $3,
+                        Op: $2,
+                    } 
+                }
+			// | a_expr TNOT_EQUALS a_expr
+			// 	{
+            //          $$ = &lyx.AExprOp{
+            //             Left: $1,
+            //             Right: $3,
+            //             Op: $2,
+            //         } 
+            //     }
+			| a_expr OP a_expr				%prec OP
+				{
+                     $$ = &lyx.AExprOp{
+                        Left: $1,
+                        Right: $3,
+                        Op: $2,
+                    } 
+                }
+
+			| a_expr AND a_expr
+				{
+                     $$ = &lyx.AExprOp{
+                        Left: $1,
+                        Right: $3,
+                        Op: $2,
+                    } 
+                }
+			| a_expr OR a_expr
+				{
+                     $$ = &lyx.AExprOp{
+                        Left: $1,
+                        Right: $3,
+                        Op: $2,
+                    } 
+                }
+			| NOT a_expr
+				{
+                     $$ = &lyx.AExprNot{Arg:$2}
+                }
+
+
+where_clause:
+    /* empty */
+    {
+        $$ = &lyx.AExprEmpty{}
+    }
+    | WHERE a_expr
+    {
+        $$ = $2
+    }
+
+
+show_statement_type:
+	IDENT
+	{
+		switch v := strings.ToLower(string($1)); v {
+		case DatabasesStr, RoutersStr, PoolsStr, 
+			InstanceStr, ShardsStr, BackendConnectionsStr, 
+			KeyRangesStr, KeyRangesExtendedStr, StatusStr,
+			DistributionsStr, CoordinatorAddrStr, VersionStr,
+			ReferenceRelationsStr, TaskGroupStr, TaskGroupsStr,
+			PreparedStatementsStr, QuantilesStr, SequencesStr,
+			IsReadOnlyStr, MoveStatsStr, TsaCacheStr, Users,
+			MoveTaskStr, MoveTasksStr, UniqueIndexesStr,
+			TaskGroupExtendedStr, TaskGroupsExtendedStr, RedistributeTasksStr,
+			ErrorStr, StartupFinishedStr, TwoPhaseTXStr, TwoPhaseTXStorageStr,
+			FileSettingsStr:
+			$$ = v
+		default:
+			$$ = UnsupportedStr
+		}
+	} | RELATIONS {
+		$$ = $1
+	} | HOSTS {
+		$$ = $1
+	} | SHARDS {
+		$$ = $1
+	} | CLIENTS {
+		$$ = $1
+	}
+
+kill_statement_type:
+	CLIENT 
+	{
+		$$ = string($1)
+	}
+	| IDENT
+	{
+		switch v := string($1); v {
+		case BackendStr:
+			$$ = v
+		default:
+			$$ = UnsupportedStr
+		}
+	}
+
+opt_cascade:
+	CASCADE { $$ = true } | {$$ = false}
+
+drop_stmt:
+	DROP key_range_stmt
+	{
+		$$ = &Drop{Element: $2}
+	}
+	| DROP KEY RANGE ALL
+	{
+		$$ = &Drop{Element: &KeyRangeSelector{KeyRangeID: `*`}}
+	}
+	| DROP distribution_select_stmt opt_cascade
+	{
+		$$ = &Drop{Element: $2, CascadeDelete: $3}
+	}
+	| DROP DISTRIBUTION ALL opt_cascade
+	{
+		$$ = &Drop{Element: &DistributionSelector{ID: `*`}, CascadeDelete: $4}
+	}
+	| DROP SHARD any_id opt_cascade
+	{
+		$$ = &Drop{Element: &ShardSelector{ID: $3}, CascadeDelete: $4}
+	}
+	| DROP TASK GROUP any_id opt_cascade
+	{
+		$$ = &Drop{Element: &TaskGroupSelector{ ID: $4 }, CascadeDelete: $5}
+	}
+	| DROP SEQUENCE any_id opt_cascade
+	{
+		$$ = &Drop{Element: &SequenceSelector{Name: $3}, CascadeDelete: $4}
+	}
+	| DROP REFERENCE table_or_relation any_id
+	{
+		$$ = &Drop{
+			Element: &ReferenceRelationSelector{
+				ID: $4,
+			},
+		}
+	}
+	| DROP UNIQUE INDEX any_id 
+	{
+		$$ = &Drop{
+			Element: &UniqueIndexSelector{
+				ID: $4,
+			},
+		}
+	}
+	| DROP REDISTRIBUTE TASK any_id opt_cascade
+	{
+		$$ = &Drop{
+			Element: &RedistributeTaskSelector{
+				ID: $4,
+			},
+			CascadeDelete: $5,
+		}
+	}
+	| DROP MOVE TASK any_id
+	{
+		$$ = &Drop{
+			Element: &MoveTaskSelector{
+				ID: $4,
+			},
+		}
+	}
+
+add_stmt:
+	// TODO: drop
+	ADD distribution_define_stmt
+	{
+		$$ = &Create{Element: $2}
+	}
+	|
+	ADD key_range_define_stmt
+	{
+		$$ = &Create{Element: $2}
+	} |
+	ADD shard_define_stmt
+	{
+		$$ = &Create{Element: $2}
+	}
+
+trace_stmt:
+	START TRACE ALL MESSAGES
+	{
+		$$ = &TraceStmt{All: true}
+	} | 
+	START TRACE CLIENT any_uint {
+		$$ = &TraceStmt {
+			Client: $4,
+		}
+	}
+
+stoptrace_stmt:
+	STOP TRACE MESSAGES
+	{
+		$$ = &StopTraceStmt{}
+	}
+
+
+alter_sys_target:
+	SYSTEM RELOAD {
+		$$ = &System{
+			Reload: true,
+		}
+	} | SYSTEM RESTART {
+		$$ = &System{
+			Restart: true,
+		}
+	} 
+
+alter_stmt:
+	ALTER distribution_alter_stmt
+	{
+		$$ = &Alter{Element: $2}
+	} | 
+	ALTER alter_sys_target
+	{
+		$$ = &Alter{Element: $2}
+	}
+	|
+	ALTER SHARD any_id alter_shard_options
+	{
+		$4.Id = $3
+		$$ = &Alter{Element: $4}
+	}
+
+alter_shard_options:
+	alter_shard_options SSLMODE any_val
+	{
+		if !validSslModes[$3] {
+			yylex.Error(fmt.Sprintf("invalid sslmode %q; valid values are: disable, allow, prefer, require, verify-ca, verify-full", $3))
+			return 1
+		}
+		$$ = $1
+		$$.SslMode = $3
+	}
+	|
+	alter_shard_options WITH HOSTS any_id_list
+	{
+		$$ = $1
+		$$.Hosts = $4
+	}
+	|
+	alter_shard_options CERT_FILE any_val
+	{
+		$$ = $1
+		$$.CertFile = $3
+	}
+	|
+	alter_shard_options KEY_FILE any_val
+	{
+		$$ = $1
+		$$.KeyFile = $3
+	}
+	|
+	alter_shard_options ROOT_CERT_FILE any_val
+	{
+		$$ = $1
+		$$.RootCertFile = $3
+	}
+	|
+	SSLMODE any_val
+	{
+		if !validSslModes[$2] {
+			yylex.Error(fmt.Sprintf("invalid sslmode %q; valid values are: disable, allow, prefer, require, verify-ca, verify-full", $2))
+			return 1
+		}
+		$$ = &AlterShard{SslMode: $2}
+	}
+	|
+	WITH HOSTS any_id_list
+	{
+		$$ = &AlterShard{Hosts: $3}
+	}
+	|
+	CERT_FILE any_val
+	{
+		$$ = &AlterShard{CertFile: $2}
+	}
+	|
+	KEY_FILE any_val
+	{
+		$$ = &AlterShard{KeyFile: $2}
+	}
+	|
+	ROOT_CERT_FILE any_val
+	{
+		$$ = &AlterShard{RootCertFile: $2}
+	}
+
+distribution_alter_stmt:
+	distribution_select_stmt relation_attach_stmt
+	{
+		$$ = &AlterDistribution{
+			Distribution: $1,
+			Element: &AttachRelation{
+				Relations:     $2,
+			},
+		}
+	} |
+	distribution_select_stmt DETACH RELATION qualified_name
+	{
+		$$ = &AlterDistribution{
+			Distribution: $1,
+			Element: &DetachRelation{
+				RelationName: $4,
+			},
+		}
+	} |
+	distribution_select_stmt relation_alter_stmt_v2
+	{
+		$$ = &AlterDistribution{
+			Distribution: $1,
+			Element: $2,
+		}
+	} |
+	distribution_select_stmt ADD DEFAULT SHARD any_id
+	{
+		$$ = &AlterDistribution{
+			Distribution: $1,
+			Element: &AlterDefaultShard{
+				Shard: $5,
+			},
+		}
+	} |
+	distribution_select_stmt DROP DEFAULT SHARD
+	{
+		$$ = &AlterDistribution{
+			Distribution: $1,
+			Element: &DropDefaultShard{},
+		}
+	}
+
+
+distribution_key_argument_list: 
+    distribution_key_argument_list TCOMMA distribution_key_entry
+    {
+      $$ = append($1, $3)
+    } | distribution_key_entry {
+      $$ = []DistributionKeyEntry {
+		  $1,
+	  }
+    } 
+
+typed_col_ref:
+	any_id col_types_elem {
+		$$ = TypedColRef{
+			Column: $1,
+			Type: $2,
+		}
+	}
+
+
+routing_expr_column_list:
+	typed_col_ref {
+		$$ = []TypedColRef{ $1 }
+	} | routing_expr_column_list TCOMMA typed_col_ref {
+		$$ = append($1, $3)
+	}
+
+routing_expr:
+	hash_function_name TOPENSQBR routing_expr_column_list TCLOSESQBR {
+		$$ = DistributionKeyEntry{
+			HashFunction: $1,
+			Expr: $3,
+		}
+	}
+
+distribution_key_entry:
+	any_id opt_hash_function_clause
+	{
+		$$ = DistributionKeyEntry {
+			Column: $1,
+			HashFunction: $2,
+		}
+	} | routing_expr {
+		$$ = $1
+	}
+
+distributed_relation_def:
+	RELATION qualified_name DISTRIBUTION KEY distribution_key_argument_list opt_auto_increment
+	{
+		$$ = &DistributedRelation{
+			Relation:    	 $2,
+			DistributionKey: $5,
+			AutoIncrementEntries: $6,
+		}
+	} 
+	| RELATION qualified_name TOPENBR distribution_key_argument_list opt_auto_increment TCLOSEBR
+	{
+		$$ = &DistributedRelation{
+			Relation:    	 $2,
+			DistributionKey: $4,
+			AutoIncrementEntries: $5,
+		}
+	} 
+
+opt_auto_increment:
+    AUTO INCREMENT auto_inc_argument_list {
+        $$ = $3
+    } | /* EMPTY */ {
+        $$ = nil
+    }
+
+auto_inc_argument_list: 
+    auto_inc_argument_list TCOMMA auto_increment_entry
+    {
+      $$ = append($1, $3)
+    } | auto_increment_entry {
+      $$ = []*AutoIncrementEntry {
+		  $1,
+	  }
+    } 
+
+auto_increment_entry:
+	any_id opt_auto_increment_start_clause
+	{
+		$$ = &AutoIncrementEntry {
+			Column: $1,
+			Start: uint64($2),
+		}
+	}
+
+opt_auto_increment_start_clause:
+	START any_uint
+	{
+		$$ = $2
+	} | /* EMPTY */ {
+		$$ = 0
+	}
+
+
+distributed_relation_list_def:
+	distributed_relation_def {
+		$$ = []*DistributedRelation{$1}
+	} | distributed_relation_list_def distributed_relation_def {
+		$$  = append($1, $2)
+	}
+
+relation_attach_stmt:
+	ATTACH distributed_relation_list_def {
+		$$ = $2
+	}
+
+relation_alter_stmt_v2:
+	ALTER RELATION qualified_name DISTRIBUTION KEY distribution_key_argument_list {
+		$$ = &AlterRelationV2{
+			RelationName: $3,
+			Element: &AlterRelationDistributionKey{
+				DistributionKey: $6,
+			},
+		}
+	} |
+	ALTER RELATION qualified_name SCHEMA any_id {
+		$$ = &AlterRelationV2{
+			RelationName: $3,
+			Element: &AlterRelationSchema {
+				SchemaName: $5,
+			},
+		}
+	} |
+	ALTER RELATION qualified_name RENAME DISTRIBUTION COLUMN any_id TO any_id {
+		$$ = &AlterRelationV2{
+			RelationName: $3,
+			Element: &RenameDistributionColumn{
+				OldName: $7,
+				NewName: $9,
+			},
+		}
+	}
+
+opt_distributed:
+	DISTRIBUTED | {} /* nothing */
+
+table_or_relation:
+	TABLE {} | RELATION {}
+
+tables_or_relations:
+	TABLES {} | RELATIONS {}
+
+
+opt_on_shards:
+	ON any_id_list { $$ = $2 } | 
+	ON SHARDS any_id_list { $$ = $3 } | /* nothing */ {}
+
+create_stmt:
+	CREATE distribution_define_stmt
+	{
+		$$ = &Create{Element: $2}
+	}
+	|
+	CREATE key_range_define_stmt
+	{
+		$$ = &Create{Element: $2}
+	}
+	|
+	CREATE shard_define_stmt
+	{
+		$$ = &Create{Element: $2}
+	}
+	|
+	CREATE REFERENCE table_or_relation qualified_name opt_auto_increment opt_on_shards
+	{
+		$$ = &Create{
+			Element: &ReferenceRelationDefinition{
+				TableName: $4,
+                AutoIncrementEntries: $5,
+				ShardIds: $6,
+			},
+		}
+	}
+	|
+	CREATE UNIQUE INDEX any_id ON qualified_name COLUMNS TOPENBR routing_expr_column_list TCLOSEBR
+	{
+		$$ = &Create{
+			Element: &UniqueIndexDefinition{
+				ID:        $4,
+				TableName: $6,
+				Columns:    $9,
+			},
+		}
+	}
+
+opt_distribution_selector:
+	FOR DISTRIBUTION any_id {
+		$$ = &DistributionSelector{ID: $3}
+	} |
+	IN any_id {
+		$$ = &DistributionSelector{ID: $2}
+	} |  /* empty means default */ {
+		$$ = &DistributionSelector{ID: "default"}
+	}
+
+create_distributed_relation_stmt:
+	CREATE opt_distributed distributed_relation_def opt_distribution_selector
+	{
+		$$ = &Alter{
+			Element: &AlterDistribution{
+				Distribution: 	$4,
+				Element: &AttachRelation{
+					Relations:      []*DistributedRelation{$3},
+				},
+			},
+		}
+	}
+
+
+opt_asc_desc: ASC							{ $$ = lyx.SORTBY_ASC }
+			| DESC							{ $$ = lyx.SORTBY_DESC }
+			| /*EMPTY*/						{ $$ = lyx.SORTBY_DEFAULT }
+
+order_clause:
+    ORDER BY ColRef opt_asc_desc 
+	{
+		$$ = &lyx.SortBy{
+			Node: $3,
+			SortbyDir: $4,
+		}
+	} 
+	| /* empty */    {$$ = nil}
+
+
+group_clause:
+	GROUP BY ColRef_list
+	{
+		$$ = GroupBy{Col: $3}
+	}
+	| /* empty */	 {$$ = GroupByClauseEmpty{}}
+
+
+show_columns_list:
+	any_id { $$ = []string{$1}} | show_columns_list TCOMMA any_id { $$ = append($1, $3)}
+
+opt_show_columns:
+	/* Empty */ { $$ = nil } | 
+	TOPENBR show_columns_list TCLOSEBR {$$ = $2}
+
+show_stmt:
+	SHOW show_statement_type opt_show_columns where_clause group_clause order_clause
+	{
+		$$ = &Show{Cmd: $2, Columns: $3, Where: $4, GroupBy: $5, Order: $6}
+	}
+
+help_stmt:
+	HELP
+	{
+		$$ = &Help{CommandName: ""}
+	}
+	| HELP help_command_name
+	{
+		$$ = &Help{CommandName: $2}
+	}
+
+// help_command_name accepts any sequence of keywords/identifiers
+// to allow flexible command lookup like "HELP CREATE DISTRIBUTION"
+help_command_name:
+	help_word
+	{
+		$$ = $1
+	}
+	| help_command_name help_word
+	{
+		$$ = $1 + " " + $2
+	}
+
+// help_word matches keywords and identifiers that can appear in command names
+help_word:
+	IDENT { $$ = $1 }
+	| CREATE { $$ = "CREATE" }
+	| DROP { $$ = "DROP" }
+	| ALTER { $$ = "ALTER" }
+	| SHOW { $$ = "SHOW" }
+	| KEY { $$ = "KEY" }
+	| RANGE { $$ = "RANGE" }
+	| DISTRIBUTION { $$ = "DISTRIBUTION" }
+	| SHARD { $$ = "SHARD" }
+	| SHARDS { $$ = "SHARDS" }
+	| LOCK { $$ = "LOCK" }
+	| UNLOCK { $$ = "UNLOCK" }
+	| SPLIT { $$ = "SPLIT" }
+	| UNITE { $$ = "UNITE" }
+	| MOVE { $$ = "MOVE" }
+	| REDISTRIBUTE { $$ = "REDISTRIBUTE" }
+	| ROUTER { $$ = "ROUTER" }
+	| REGISTER { $$ = "REGISTER" }
+	| UNREGISTER { $$ = "UNREGISTER" }
+	| TABLE { $$ = "TABLE" }
+	| TABLES { $$ = "TABLES" }
+	| RELATION { $$ = "RELATION" }
+	| RELATIONS { $$ = "RELATIONS" }
+	| REFERENCE { $$ = "REFERENCE" }
+	| ATTACH { $$ = "ATTACH" }
+	| DETACH { $$ = "DETACH" }
+	| SEQUENCE { $$ = "SEQUENCE" }
+	| CLIENT { $$ = "CLIENT" }
+	| CLIENTS { $$ = "CLIENTS" }
+	| CACHE { $$ = "CACHE" }
+	| INVALIDATE { $$ = "INVALIDATE" }
+	| SYNC { $$ = "SYNC" }
+	| TASK { $$ = "TASK" }
+	| GROUP { $$ = "GROUP" }
+	| INDEX { $$ = "INDEX" }
+	| UNIQUE { $$ = "UNIQUE" }
+	| DEFAULT { $$ = "DEFAULT" }
+	| ALL { $$ = "ALL" }
+
+lock_stmt:
+	LOCK key_range_stmt
+	{
+		$$ = &Lock{KeyRangeID: $2.KeyRangeID}
+	}
+	// or lock something else
+
+
+distribution_define_stmt:
+	DISTRIBUTION any_id opt_col_types opt_default_shard
+	{
+		$$ = &DistributionDefinition{
+			ID: $2,
+			ColTypes: $3,
+			DefaultShard: $4,
+		}
+	}
+
+opt_col_types:
+	COLUMN TYPES col_types_list {
+		$$ = $3
+	} | TOPENBR col_types_list TCLOSEBR {
+		/* modern variant */
+		$$ = $2
+	} | { 
+		/* empty column types should be prohibited */
+		$$ = nil 
+	}
+
+col_types_list:
+	col_types_list TCOMMA col_types_elem {
+		$$ = append($1, $3)
+	} | col_types_elem {
+		$$ = []string {
+			$1,
+		}
+	}
+
+col_types_elem:
+	VARCHAR {
+		$$ = qdb.ColumnTypeVarchar
+	} | VARCHAR HASH {
+		$$ = qdb.ColumnTypeVarcharHashed
+	} | INTEGER {
+		$$ = qdb.ColumnTypeInteger
+	} | INT {
+		$$ = qdb.ColumnTypeInteger
+	} | INTEGER HASH {
+		$$ = qdb.ColumnTypeUinteger
+	} | INT HASH {
+		$$ = qdb.ColumnTypeUinteger
+	} | UUID {
+		$$ = qdb.ColumnTypeUUID
+	}
+
+opt_default_shard:
+	DEFAULT SHARD any_id {
+		$$ = $3
+	} | /* EMPTY */ {
+		$$ = ""
+	}
+
+hash_function_name:
+	IDENTITY {
+		$$ = "identity"
+	} | MURMUR {
+		$$ = "murmur"
+	} | CITY {
+		$$ = "city"
+	}
+
+opt_function:
+	FUNCTION {} | {}
+
+hash_function_clause:
+	HASH opt_function hash_function_name
+	{
+		$$ = $3
+	}
+
+opt_hash_function_clause:
+	hash_function_clause {
+		$$ = $1
+	} | /* EMPTY */ {
+		$$ = ""
+	}
+
+key_range_bound_elem:
+	SCONST
+	{
+		$$ = []byte($1)
+	} | 
+	IDENT
+	{
+		$$ = []byte($1)
+	} | ICONST {
+		if $1 > uint(math.MaxInt64) {
+			yylex.Error(SIGNED_INT_RANGE_ERROR)
+			return 1
+		} else {
+			buf := make([]byte, binary.MaxVarintLen64)
+			binary.PutVarint(buf, int64($1))
+			$$ = buf
+		}
+	} | TMINUS ICONST {
+		if $2 > uint(-math.MinInt64) {
+			yylex.Error(SIGNED_INT_RANGE_ERROR)
+			return 1
+		} else {
+			buf := make([]byte, binary.MaxVarintLen64)
+			binary.PutVarint(buf, int64(-$2))
+			$$ = buf
+		}
+	}
+
+key_range_bound:
+	key_range_bound_elem { 
+		$$ = &KeyRangeBound{
+			Pivots: [][]byte{
+				$1,
+			},
+		}
+	} 
+	| key_range_bound TCOMMA key_range_bound_elem {
+		$$ = &KeyRangeBound{
+			Pivots: append($1.Pivots, $3),
+		}
+	}
+
+
+key_range_define_stmt:
+	KEY RANGE any_id FROM key_range_bound ROUTE TO shard_id opt_distribution_selector
+	{
+		$$ = &KeyRangeDefinition{
+			KeyRangeID: $3,
+			LowerBound: $5,
+			ShardID: $8,
+			Distribution: $9,
+		}
+	}
+	| KEY RANGE FROM key_range_bound ROUTE TO any_id opt_distribution_selector
+	{
+		str, err := randomHex(6)
+		if err != nil {
+			panic(err)
+		}
+		$$ = &KeyRangeDefinition{
+			LowerBound: $4,
+			ShardID: $7,
+			Distribution: $8,
+			KeyRangeID: "kr"+str,
+		}
+	}
+
+shard_define_stmt:
+	SHARD any_id WITH HOSTS any_id_list opt_shard_tls
+	{
+		sd := $6
+		sd.Id = $2
+		sd.Hosts = $5
+		$$ = sd
+	}
+	|
+	SHARD WITH HOSTS any_id_list opt_shard_tls
+	{
+		str, err := randomHex(6)
+		if err != nil {
+			panic(err)
+		}
+		sd := $5
+		sd.Id = "shard" + str
+		sd.Hosts = $4
+		$$ = sd
+	}
+
+opt_shard_tls:
+	opt_shard_tls SSLMODE any_val
+	{
+		if !validSslModes[$3] {
+			yylex.Error(fmt.Sprintf("invalid sslmode %q; valid values are: disable, allow, prefer, require, verify-ca, verify-full", $3))
+			return 1
+		}
+		$$ = $1
+		$$.SslMode = $3
+	}
+	|
+	opt_shard_tls CERT_FILE any_val
+	{
+		$$ = $1
+		$$.CertFile = $3
+	}
+	|
+	opt_shard_tls KEY_FILE any_val
+	{
+		$$ = $1
+		$$.KeyFile = $3
+	}
+	|
+	opt_shard_tls ROOT_CERT_FILE any_val
+	{
+		$$ = $1
+		$$.RootCertFile = $3
+	}
+	| /* empty */
+	{
+		$$ = &ShardDefinition{}
+	}
+
+any_id_list:
+	any_val
+	{
+		$$ = []string{$1}
+	}
+	|
+	any_id_list TCOMMA any_val
+	{
+		$$ = append($1, $3)
+	} 
+
+unlock_stmt:
+	UNLOCK key_range_stmt
+	{
+		$$ = &Unlock{KeyRangeID: $2.KeyRangeID}
+	}
+
+key_range_stmt:
+	KEY RANGE any_id
+	{
+		$$ = &KeyRangeSelector{KeyRangeID: $3}
+	}
+
+distribution_select_stmt:
+	DISTRIBUTION any_id
+	{
+		$$ = &DistributionSelector{ID: $2}
+	}
+
+split_key_range_stmt:
+	SPLIT key_range_stmt FROM any_id BY key_range_bound
+	{
+		$$ = &SplitKeyRange{KeyRangeID: $2.KeyRangeID, KeyRangeFromID: $4, Border: $6}
+	}
+
+kill_stmt:
+	KILL kill_statement_type any_uint
+	{
+		$$ = &Kill{Cmd: $2, Target: $3}
+	} |	KILL kill_statement_type IDENT
+	{
+		n, err := strconv.ParseUint($3, 10, 64)
+		if err == nil {
+			$$ = &Kill{Cmd: $2, Target: uint(n)}
+		}
+	}
+
+
+move_key_range_stmt:
+	MOVE key_range_stmt TO any_id
+	{
+		$$ = &MoveKeyRange{KeyRangeID: $2.KeyRangeID, DestShardID: $4}
+	}
+
+opt_redistr_id:
+	TASK GROUP any_id {$$ = $3} | /* nothing */ {$$=""}
+
+/* All of this is kinda uggly, refactor to make it more Postgresy */
+redistribute_stmt:
+	REDISTRIBUTE key_range_stmt TO any_id opt_batch_size opt_redistr_id
+	{
+		$$ = &RedistributeKeyRange{
+			KeyRangeID: $2.KeyRangeID,
+			DestShardID: $4,
+			BatchSize: $5,
+			Id: $6,
+			Check: true,
+			Apply: true,
+		}
+	} | REDISTRIBUTE key_range_stmt TO any_id opt_batch_size opt_redistr_id CHECK {
+		$$ = &RedistributeKeyRange{
+			KeyRangeID: $2.KeyRangeID,
+			DestShardID: $4,
+			BatchSize: $5,
+			Id: $6,
+			Check: true,
+		}
+	} | REDISTRIBUTE key_range_stmt TO any_id opt_batch_size opt_redistr_id APPLY {
+		$$ = &RedistributeKeyRange{
+			KeyRangeID: $2.KeyRangeID,
+			DestShardID: $4,
+			BatchSize: $5,
+			Id: $6,
+			Apply: true,
+		}
+	} | REDISTRIBUTE key_range_stmt TO any_id opt_batch_size opt_redistr_id NOWAIT {
+		$$ = &RedistributeKeyRange{
+			KeyRangeID: $2.KeyRangeID,
+			DestShardID: $4,
+			BatchSize: $5,
+			Id: $6,
+			Check: false, /* or true, doesnt matter */
+			Apply: true,
+			NoWait: true,
+		}
+	}
+
+opt_batch_size: BATCH SIZE any_uint			{ $$ = int($3) }
+			| /*EMPTY*/						{ $$ = -1 }
+
+unite_key_range_stmt:
+	UNITE key_range_stmt WITH any_id
+	{
+		$$ = &UniteKeyRange{KeyRangeIDL: $2.KeyRangeID, KeyRangeIDR: $4}
+	}
+
+listen_stmt:
+	LISTEN any_val
+	{
+		$$ = &Listen{addr: $2}
+	}
+
+shutdown_stmt:
+	SHUTDOWN
+	{
+		$$ = &Shutdown{}
+	}
+
+invalidate_stmt:
+	INVALIDATE CACHE
+	{
+		$$ = &Invalidate{
+			Target: SchemaCacheInvalidateTarget,
+		}
+	} | INVALIDATE SCHEMA CACHE
+	{
+		$$ =  &Invalidate{
+			Target: SchemaCacheInvalidateTarget,
+		}
+	} | INVALIDATE BACKENDS
+	{
+		$$ = &Invalidate{
+			Target: BackendConnectionsInvalidateTarget,
+		}
+	} | INVALIDATE STALE CLIENTS
+	{
+		$$ = &Invalidate{
+			Target: StaleClientsInvalidateTarget,
+		}
+	}
+
+sync_reference_tables_stmt:
+	SYNC REFERENCE tables_or_relations ON any_id
+	{
+		$$ = &SyncReferenceTables {
+			ShardID: $5,
+			RelationSelector: "*",
+		}
+	} | SYNC REFERENCE table_or_relation any_id ON any_id
+	{
+		$$ = &SyncReferenceTables {
+			ShardID: $6,
+			RelationSelector: $4,
+		}
+	}
+
+alter_reference_table_storage_stmt:
+	ALTER REFERENCE table_or_relation qualified_name STORAGE TO TOPENBR any_id_list TCLOSEBR
+	{
+		$$ = &AlterReferenceTableStorage {
+			RelationSelector: $4,
+			Shards: $8,
+		}
+	}
+
+// coordinator
+
+register_router_stmt:
+	REGISTER ROUTER any_id ADDRESS any_val
+	{
+		$$ = &RegisterRouter{ID: $3, Addr: $5}
+	}
+
+unregister_router_stmt:
+	UNREGISTER ROUTER any_id
+	{
+		$$ = &UnregisterRouter{ID: $3}
+	} 
+	|
+	UNREGISTER ROUTER ALL
+    {
+        $$ = &UnregisterRouter{ID: `*`}
+    }
+
+// move tasks
+
+retry_move_task_group:
+	RETRY opt_move TASK GROUP any_id opt_no_wait
+	{
+		$$ = &RetryMoveTaskGroup{ ID: $5, NoWait: $6 }
+	}
+	|
+	RETRY opt_move TASK GROUP ALL opt_no_wait
+	{
+		$$ = &RetryMoveTaskGroup{ ID: "*", NoWait: $6 }
+	}
+	
+
+opt_no_wait:
+	NOWAIT {
+		$$ = true
+	} | /* EMPTY */ {
+		$$ = false
+	}
+
+
+stop_move_task_group:
+	STOP opt_move TASK GROUP any_id
+	{
+		$$ = &StopMoveTaskGroup{ ID: $5 }
+	}
+	|
+	STOP opt_move TASK GROUP ALL
+	{
+		$$ = &StopMoveTaskGroup{ ID: "*" }
+	}
+
+opt_move:
+	MOVE {} | /* nothing */ {}
+
+
+/* Control Points */
+
+opt_duration:
+	any_uint SECONDS {
+		$$ = time.Duration(time.Duration($1) * time.Second)
+	} | /* EMPTY */ {
+		$$ = time.Duration(1 * time.Minute)
+	}
+
+opt_icp_action:
+	SLEEP opt_duration {
+		$$ = &ICPointAction{
+			Act: "sleep",
+			Timeout: $2,
+		}
+	} | WAIT {
+		$$ = &ICPointAction{
+			Act: "wait",
+		}
+	} | PANIC {
+		$$ = &ICPointAction{
+			Act: "panic",
+		}
+	} | /* empty */ {
+		$$ = &ICPointAction{
+			Act: "panic",
+		}
+	}
+
+icp_stmt:
+	ATTACH CONTROL POINT IDENT opt_icp_action {
+		$$ = &InstanceControlPoint {
+			Name: string($4),
+			Enable: true,
+			A:		$5,
+		}
+	} | 
+	DETACH CONTROL POINT IDENT {
+		$$ = &InstanceControlPoint {
+			Name: string($4),
+			Enable: false,
+		}
+	}
+
+%%
+

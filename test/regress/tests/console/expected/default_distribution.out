@@ -1,0 +1,58 @@
+CREATE KEY RANGE krid1 FROM 1 ROUTE TO sh1;
+ERROR:  you don't have any distributions
+CREATE DISTRIBUTION ds1 COLUMN TYPES integer;
+    add distribution    
+------------------------
+ distribution id -> ds1
+(1 row)
+
+CREATE KEY RANGE krid2 FROM 11 ROUTE TO sh1;
+ add key range 
+---------------
+ bound -> 11
+(1 row)
+
+CREATE KEY RANGE krid1 FROM 1 ROUTE TO sh1;
+ add key range 
+---------------
+ bound -> 1
+(1 row)
+
+CREATE DISTRIBUTED RELATION r1 (id);
+      attach table      
+------------------------
+ relation name   -> r1
+ distribution id -> ds1
+(2 rows)
+
+SHOW key_ranges;
+ key_range_id | shard_id | distribution_id | lower_bound | locked 
+--------------+----------+-----------------+-------------+--------
+ krid1        | sh1      | ds1             | 1           | false
+ krid2        | sh1      | ds1             | 11          | false
+(2 rows)
+
+CREATE DISTRIBUTION ds2 COLUMN TYPES integer;
+    add distribution    
+------------------------
+ distribution id -> ds2
+(1 row)
+
+CREATE KEY RANGE krid3 FROM 11 ROUTE TO sh2;
+ERROR:  distributions count not equal one, use FOR DISTRIBUTION syntax
+CREATE DISTRIBUTED RELATION r1 (id);
+ERROR:  distributions count not equal one, use FOR DISTRIBUTION syntax
+SHOW key_ranges;
+ key_range_id | shard_id | distribution_id | lower_bound | locked 
+--------------+----------+-----------------+-------------+--------
+ krid1        | sh1      | ds1             | 1           | false
+ krid2        | sh1      | ds1             | 11          | false
+(2 rows)
+
+DROP DISTRIBUTION ALL CASCADE;
+ distribution_id 
+-----------------
+ ds1
+ ds2
+(2 rows)
+

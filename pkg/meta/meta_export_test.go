@@ -1,0 +1,4 @@
+package meta
+
+var CreateNonReplicatedDistribution = createNonReplicatedDistribution
+var CreateReferenceRelation = createReferenceRelation

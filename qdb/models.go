@@ -1,0 +1,322 @@
+package qdb
+
+import (
+	"fmt"
+	"maps"
+	"math"
+	"time"
+
+	"github.com/pg-sharding/spqr/router/rfqn"
+)
+
+type ShardKey struct {
+	Name string
+	RW   bool
+}
+
+type KeyRange struct {
+	LowerBound     [][]byte
+	ShardID        string
+	KeyRangeID     string
+	DistributionId string
+	Locked         bool
+	Version        int
+}
+
+// Do not marshal Locked field
+type internalKeyRange struct {
+	LowerBound     [][]byte `json:"from"`
+	ShardID        string   `json:"shard_id"`
+	KeyRangeID     string   `json:"key_range_id"`
+	DistributionId string   `json:"distribution_id"`
+}
+
+type KeyRangeMeta struct {
+	Version    int       `json:"version"`
+	UpdatedAt  time.Time `json:"updated_at"`
+	ModifiedBy string    `json:"modified_by"`
+}
+
+type MoveKeyRangeStatus string
+
+const (
+	MoveKeyRangePlanned              = MoveKeyRangeStatus("PLANNED")
+	MoveKeyRangeLocked               = MoveKeyRangeStatus("LOCKED")
+	MoveKeyRangeDataMoved            = MoveKeyRangeStatus("DATA_MOVED")
+	MoveKeyRangeDataCoordMetaUpdated = MoveKeyRangeStatus("COORD_META_UPDATED")
+	MoveKeyRangeComplete             = MoveKeyRangeStatus("COMPLETE")
+
+	// Deprecated: use MoveKeyRangeLocked
+	MoveKeyRangeStarted = MoveKeyRangeStatus("STARTED")
+)
+
+type MoveKeyRange struct {
+	MoveId     string             `json:"move_id"`
+	ShardId    string             `json:"shard_id"`
+	KeyRangeID string             `json:"key_range_id"`
+	Status     MoveKeyRangeStatus `json:"status"`
+}
+
+type KeyRangeStatus string
+
+const KRLocked = KeyRangeStatus("LOCKED")
+const KRUnlocked = KeyRangeStatus("UNLOCKED")
+
+type RouterState string
+
+const (
+	CLOSED = RouterState("CLOSED")
+	OPENED = RouterState("OPENED")
+)
+
+type Router struct {
+	Address string      `json:"address"`
+	ID      string      `json:"id"`
+	State   RouterState `json:"state,omitempty"`
+}
+
+func NewRouter(addr, id string, rst RouterState) *Router {
+	return &Router{
+		Address: addr,
+		ID:      id,
+		State:   rst,
+	}
+}
+
+func (r Router) Addr() string {
+	return r.Address
+}
+
+type TLSConfig struct {
+	SslMode      string `json:"sslmode,omitempty"`
+	CertFile     string `json:"cert_file,omitempty"`
+	KeyFile      string `json:"key_file,omitempty"`
+	RootCertFile string `json:"root_cert_file,omitempty"`
+}
+
+type Shard struct {
+	ID       string     `json:"id"`
+	RawHosts []string   `json:"hosts"` // format host:port:availability_zone
+	TLS      *TLSConfig `json:"tls,omitempty"`
+}
+
+func NewShard(ID string, hosts []string, tls *TLSConfig) *Shard {
+	return &Shard{
+		ID:       ID,
+		RawHosts: hosts,
+		TLS:      tls,
+	}
+}
+
+var (
+	ColumnTypeVarchar           = "varchar"
+	ColumnTypeVarcharHashed     = "varchar hashed"
+	ColumnTypeVarcharDeprecated = "_varchar"
+	ColumnTypeInteger           = "integer"
+	ColumnTypeUinteger          = "uinteger"
+	ColumnTypeUUID              = "uuid"
+)
+
+type TypedColRef struct {
+	ColName string `json:"column_name"`
+	ColType string `json:"column_type"`
+}
+
+type RoutingExpr struct {
+	ColRefs []TypedColRef `json:"column_refs_v1"`
+}
+
+type DistributionKeyEntry struct {
+	Column       string `json:"column"`
+	HashFunction string `json:"hash"`
+
+	Expr RoutingExpr `json:"routing_expression"`
+}
+
+type DistributedRelation struct {
+	Name               string                 `json:"name"`
+	SchemaName         string                 `json:"schema_name,omitempty"`
+	DistributionKey    []DistributionKeyEntry `json:"column_names"`
+	ReplicatedRelation bool                   `json:"replicated_relation,omitempty"`
+}
+
+func (r *DistributedRelation) QualifiedName() *rfqn.RelationFQN {
+	return &rfqn.RelationFQN{RelationName: r.Name, SchemaName: r.SchemaName}
+}
+
+type Distribution struct {
+	ID            string                          `json:"id"`
+	ColTypes      []string                        `json:"col_types,omitempty"`
+	Relations     map[string]*DistributedRelation `json:"relations"`
+	FQNRelations  map[string]*DistributedRelation `json:"fqn_relations,omitempty"`
+	UniqueIndexes map[string]*UniqueIndex         `json:"unique_indexes"`
+}
+
+type ReferenceRelation struct {
+	TableName             string            `json:"table_name"`
+	SchemaName            string            `json:"schema_name"`
+	SchemaVersion         uint64            `json:"schema_version"`
+	ColumnSequenceMapping map[string]string `json:"column_sequence_mapping"`
+	ShardIds              []string          `json:"shard_ids"`
+}
+
+type UniqueIndex struct {
+	ID             string            `json:"id"`
+	Relation       *rfqn.RelationFQN `json:"relation"`
+	ColumnNames    []string          `json:"column"`
+	ColTypes       []string          `json:"column_type"`
+	DistributionId string            `json:"distribution_id"`
+}
+
+func NewDistribution(id string, coltypes []string) *Distribution {
+	distr := &Distribution{
+		ID:            id,
+		ColTypes:      coltypes,
+		Relations:     map[string]*DistributedRelation{},
+		UniqueIndexes: map[string]*UniqueIndex{},
+	}
+
+	return distr
+}
+
+type MoveTask struct {
+	TaskGroupID string `json:"task_group_id"`
+	ID          string
+	Bound       [][]byte `json:"bound"`
+	KrIdTemp    string   `json:"kr_id_temp"`
+	State       int      `json:"state"`
+}
+
+const (
+	IssuerRedistributeTask = iota + 1
+	IssuerBalancerTask
+)
+
+type MoveTaskGroupIssuer struct {
+	Type int    `json:"type"`
+	Id   string `json:"id"`
+}
+
+type MoveTaskGroup struct {
+	Type      int                  `json:"type"`
+	ShardToId string               `json:"shard_to_id"`
+	KrIdFrom  string               `json:"kr_id_from"`
+	KrIdTo    string               `json:"kr_id_to"`
+	BoundRel  string               `json:"rel"`
+	Coeff     float64              `json:"coeff"`
+	BatchSize int64                `json:"batch_size"`
+	Limit     int64                `json:"limit"`
+	CreatedAt time.Time            `json:"created_at"`
+	Issuer    *MoveTaskGroupIssuer `json:"issuer"`
+}
+
+type TaskGroupStatus struct {
+	State     string    `json:"state"`
+	Message   string    `json:"msg"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+type RedistributeTask struct {
+	ID          string `json:"id"`
+	TaskGroupId string `json:"task_group_id"`
+	KeyRangeId  string `json:"kr_id"`
+	ShardId     string `json:"shard_id"`
+	BatchSize   int    `json:"batch_size"`
+	TempKrId    string `json:"temp_kr_id"`
+	State       int    `json:"state"`
+}
+
+type BalancerTask struct {
+	Type      int    `json:"type"`
+	KrIdFrom  string `json:"krIdFrom"`
+	KrIdTo    string `json:"krIdTo"`
+	KrIdTemp  string `json:"krIdTemp"`
+	ShardIdTo string `json:"shardIdTo"`
+	KeyCount  int64  `json:"keyCount"`
+	State     int    `json:"state"`
+}
+
+type Sequence struct {
+	RelName string `json:"rel_name"`
+	ColName string `json:"col_name"`
+}
+
+type SequenceIdRange struct {
+	Left  int64
+	Right int64
+}
+
+func NewSequenceIdRange(left int64, right int64) (*SequenceIdRange, error) {
+	if left <= right {
+		return &SequenceIdRange{Left: left, Right: right}, nil
+	}
+	return nil, fmt.Errorf("invalid id range: start=%d > end=%d", left, right)
+}
+
+func NewRangeBySize(currentRight int64, rangeSize uint64) (*SequenceIdRange, error) {
+	if rangeSize >= math.MaxInt64 {
+		return nil, fmt.Errorf("invalid (case 0) id-range request: current=%d, request for=%d", currentRight, rangeSize)
+	}
+	if rangeSize < 1 {
+		return nil, fmt.Errorf("invalid (case 1) id-range request: current=%d, request for=%d", currentRight, rangeSize)
+	}
+	newRight := currentRight + int64(rangeSize) - 1
+	if currentRight > newRight {
+		return nil, fmt.Errorf("invalid (case 2) id-range request: current=%d, request for=%d", currentRight, rangeSize)
+	}
+	return NewSequenceIdRange(currentRight, newRight)
+}
+
+func keyRangeToInternal(keyRange *KeyRange) *internalKeyRange {
+	return &internalKeyRange{
+		LowerBound:     keyRange.LowerBound,
+		ShardID:        keyRange.ShardID,
+		KeyRangeID:     keyRange.KeyRangeID,
+		DistributionId: keyRange.DistributionId,
+	}
+}
+
+func keyRangeFromInternal(keyRange *internalKeyRange, locked bool, version int) *KeyRange {
+	return &KeyRange{
+		LowerBound:     keyRange.LowerBound,
+		ShardID:        keyRange.ShardID,
+		KeyRangeID:     keyRange.KeyRangeID,
+		DistributionId: keyRange.DistributionId,
+		Locked:         locked,
+		Version:        version,
+	}
+}
+
+type TwoPCInfo struct {
+	Gid       string   `json:"gid"`
+	SHardsIds []string `json:"shard_ids"`
+
+	State TwoPhaseTxState `json:"state"`
+
+	/* ephemeral part of state */
+	Locked bool `json:"-"`
+}
+
+func (d *Distribution) GetRelation(fqn *rfqn.RelationFQN) (*DistributedRelation, bool) {
+	r, ok := d.Relations[fqn.RelationName]
+	if ok {
+		return r, ok
+	}
+
+	r, ok = d.FQNRelations[fqn.String()]
+	return r, ok
+}
+
+func (d *Distribution) Copy() *Distribution {
+	retDs := &Distribution{
+		ID:            d.ID,
+		ColTypes:      d.ColTypes,
+		Relations:     map[string]*DistributedRelation{},
+		FQNRelations:  map[string]*DistributedRelation{},
+		UniqueIndexes: map[string]*UniqueIndex{},
+	}
+	maps.Copy(retDs.Relations, d.Relations)
+	maps.Copy(retDs.FQNRelations, d.FQNRelations)
+	maps.Copy(retDs.UniqueIndexes, d.UniqueIndexes)
+	return retDs
+}

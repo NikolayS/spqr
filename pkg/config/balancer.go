@@ -1,0 +1,71 @@
+package config
+
+const defaultBalancerTimeout = 60
+
+type Balancer struct {
+	LogLevel string `json:"log_level" toml:"log_level" yaml:"log_level"` // TODO usage
+
+	CoordinatorAddress string `json:"coordinator_address" toml:"coordinator_address" yaml:"coordinator_address"`
+
+	ShardsConfig string `json:"shards_config" yaml:"shards_config" toml:"shards_config"`
+
+	// TODO set default values (probably the type needs to be de-exported)
+	CpuThreshold   float64 `json:"cpu_threshold" yaml:"cpu_threshold" toml:"cpu_threshold"`
+	SpaceThreshold float64 `json:"space_threshold" yaml:"space_threshold" toml:"space_threshold"`
+
+	StatIntervalSec int `json:"stat_interval_sec" yaml:"stat_interval_sec" toml:"stat_interval_sec"`
+
+	MaxMoveCount int `json:"max_move_count" yaml:"max_move_count" toml:"max_move_count"`
+	KeysPerMove  int `json:"keys_per_move" yaml:"keys_per_move" toml:"keys_per_move"`
+
+	MaxFitCoefficient float64 `json:"max_fit_coefficient" yaml:"max_fit_coefficient" toml:"max_fit_coefficient"`
+
+	TimeoutSec int `json:"timeout" yaml:"timeout" toml:"timeout"`
+}
+
+var _ Config = &Balancer{}
+
+func (b *Balancer) ApplyDefaults() {
+
+}
+
+func (b *Balancer) PostProcess() error {
+	if b.TimeoutSec == 0 {
+		b.TimeoutSec = defaultBalancerTimeout
+	}
+
+	if b.MaxFitCoefficient == 0 {
+		b.MaxFitCoefficient = 0.8
+	}
+
+	return nil
+}
+
+var cfgBalancer Balancer
+
+// LoadBalancerCfg loads the balancer configuration from the specified file path.
+//
+// Parameters:
+//   - cfgPath (string): The path of the configuration file.
+//
+// Returns:
+//   - string: JSON-formatted config
+//   - error: an error if any occurred during the loading process.
+func LoadBalancerCfg(cfgPath string) (string, error) {
+	b := &Balancer{}
+	configStr, err := LoadConfig(cfgPath, b)
+	if err != nil {
+		return "", err
+	}
+
+	cfgBalancer = *b
+	return configStr, nil
+}
+
+// BalancerConfig returns a pointer to the Balancer configuration.
+//
+// Returns:
+//   - *Balancer: a pointer to the Balancer configuration.
+func BalancerConfig() *Balancer {
+	return &cfgBalancer
+}

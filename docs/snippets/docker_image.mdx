@@ -1,0 +1,16 @@
+For the fastest experience, use our pre-built Docker image:
+
+**Available tags:**
+- `latest` - Latest stable release (recommended for production)
+- `stable` - Same as latest
+- `nightly` - Built from master branch (latest features)
+- `v1.2.3` - Specific version
+
+**Ports:**
+- `6432` - Router port (your app connects here)
+- `7432` - Admin console (configure sharding)
+- `7000` - gRPC API
+
+<Note>
+  You'll need to set up PostgreSQL shards and configure the router. See the [sharding setup](#setting-up-sharding) section below for complete instructions.
+</Note>

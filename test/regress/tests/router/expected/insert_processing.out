@@ -1,0 +1,134 @@
+\c spqr-console
+-- check that numeric type works
+CREATE DISTRIBUTION ds1 COLUMN TYPES integer;
+    add distribution    
+------------------------
+ distribution id -> ds1
+(1 row)
+
+CREATE KEY RANGE FROM 300 ROUTE TO sh4 FOR DISTRIBUTION ds1;
+ add key range 
+---------------
+ bound -> 300
+(1 row)
+
+CREATE KEY RANGE FROM 200 ROUTE TO sh3 FOR DISTRIBUTION ds1;
+ add key range 
+---------------
+ bound -> 200
+(1 row)
+
+CREATE KEY RANGE FROM 100 ROUTE TO sh2 FOR DISTRIBUTION ds1;
+ add key range 
+---------------
+ bound -> 100
+(1 row)
+
+CREATE KEY RANGE FROM 0 ROUTE TO sh1 FOR DISTRIBUTION ds1;
+ add key range 
+---------------
+ bound -> 0
+(1 row)
+
+CREATE DISTRIBUTED RELATION xx_insert_rel DISTRIBUTION KEY a IN ds1;
+           attach table           
+----------------------------------
+ relation name   -> xx_insert_rel
+ distribution id -> ds1
+(2 rows)
+
+\c regress
+CREATE TABLE xx_insert_rel(a INT, b INT, c INT);
+NOTICE: send query to shard(s) : sh1,sh2,sh3,sh4
+NOTICE: send query to shard(s) : sh1,sh2,sh3,sh4
+INSERT INTO xx_insert_rel (a, b, c) VALUES(1,2,3),(2,3,4), (3,4,5);
+NOTICE: send query to shard(s) : sh1
+INSERT INTO xx_insert_rel (a, b, c) VALUES(1,2,3),(2,3,4), (300,4,5) /*__spqr__engine_v2: false */;
+NOTICE: send query to shard(s) : sh1,sh4
+INSERT INTO xx_insert_rel (a, b, c) VALUES(100,2,3),(201,3,4), (301,4,5) ON CONFLICT DO NOTHING /*__spqr__engine_v2: false */;
+NOTICE: send query to shard(s) : sh2,sh3,sh4
+INSERT INTO xx_insert_rel (a, b, c) VALUES(200,2,3),(201,3,4), (301,4,5) RETURNING * /*__spqr__engine_v2: false */;
+NOTICE: send query to shard(s) : sh3,sh4
+  a  | b | c 
+-----+---+---
+ 200 | 2 | 3
+ 201 | 3 | 4
+ 301 | 4 | 5
+(3 rows)
+
+BEGIN;
+INSERT INTO xx_insert_rel (a, b, c) VALUES(200,2,3),(201,3,4), (301,4,5) RETURNING * /*__spqr__engine_v2: true */;
+NOTICE: send query to shard(s) : sh3,sh4
+  a  | b | c 
+-----+---+---
+ 200 | 2 | 3
+ 201 | 3 | 4
+ 301 | 4 | 5
+(3 rows)
+
+ROLLBACK;
+INSERT INTO xx_insert_rel (a, b, c) SELECT 1,2,3;
+NOTICE: send query to shard(s) : sh1
+INSERT INTO xx_insert_rel (a, b, c) SELECT 101,201,301;
+NOTICE: send query to shard(s) : sh2
+INSERT INTO xx_insert_rel (a, b, c) SELECT 201,a,301 FROM unnest(ARRAY[110]) a;;
+NOTICE: send query to shard(s) : sh3
+--INSERT INTO xx_insert_rel (a, b, c) SELECT 1,2,3 UNION ALL SELECT 2,3,4;
+SELECT * FROM xx_insert_rel ORDER BY 1,2,3 /* __spqr__execute_on: sh1 */;
+NOTICE: send query to shard(s) : sh1
+ a | b | c 
+---+---+---
+ 1 | 2 | 3
+ 1 | 2 | 3
+ 1 | 2 | 3
+ 2 | 3 | 4
+ 2 | 3 | 4
+ 3 | 4 | 5
+(6 rows)
+
+SELECT * FROM xx_insert_rel ORDER BY 1,2,3 /* __spqr__execute_on: sh2 */;
+NOTICE: send query to shard(s) : sh2
+  a  |  b  |  c  
+-----+-----+-----
+ 100 |   2 |   3
+ 101 | 201 | 301
+(2 rows)
+
+SELECT * FROM xx_insert_rel ORDER BY 1,2,3 /* __spqr__execute_on: sh3 */;
+NOTICE: send query to shard(s) : sh3
+  a  |  b  |  c  
+-----+-----+-----
+ 200 |   2 |   3
+ 201 |   3 |   4
+ 201 |   3 |   4
+ 201 | 110 | 301
+(4 rows)
+
+SELECT * FROM xx_insert_rel ORDER BY 1,2,3 /* __spqr__execute_on: sh4 */;
+NOTICE: send query to shard(s) : sh4
+  a  | b | c 
+-----+---+---
+ 300 | 4 | 5
+ 301 | 4 | 5
+ 301 | 4 | 5
+(3 rows)
+
+explain (COSTS OFF ) SELECT * FROM xx_insert_rel WHERE a = 1 ORDER BY 1,2,3;
+NOTICE: send query to shard(s) : sh1
+           QUERY PLAN            
+---------------------------------
+ Sort
+   Sort Key: b, c
+   ->  Seq Scan on xx_insert_rel
+         Filter: (a = 1)
+(4 rows)
+
+DROP TABLE xx_insert_rel;
+NOTICE: send query to shard(s) : sh1,sh2,sh3,sh4
+\c spqr-console
+DROP DISTRIBUTION ALL CASCADE;
+ distribution_id 
+-----------------
+ ds1
+(1 row)
+

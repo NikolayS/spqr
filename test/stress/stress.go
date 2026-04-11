@@ -2,13 +2,14 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"math/rand"
 	"sync"
 	"time"
 
-	"github.com/jmoiron/sqlx"
 	_ "github.com/lib/pq"
+	"github.com/pg-sharding/spqr/pkg/spqrlog"
 	"github.com/spf13/cobra"
 )
 
@@ -24,14 +25,13 @@ var (
 	sslmode  string
 )
 
-func getConn(ctx context.Context, dbname string, retryCnt int) (*sqlx.DB, error) {
+func getConn(dbname string, retryCnt int) (*sql.DB, error) {
 	pgConString := fmt.Sprintf("host=%s port=%d dbname=%s sslmode=%v user=%s", hostname, spqrPort, dbname, sslmode, username)
 	fmt.Printf("using connstring %s\n", pgConString)
-	for i := 0; i < retryCnt; i++ {
-		db, err := sqlx.ConnectContext(ctx, "postgres", pgConString)
+	for range retryCnt {
+		db, err := sql.Open("postgres", pgConString)
 		if err != nil {
-			err = fmt.Errorf("error while connecting to postgresql: %w", err)
-			fmt.Println(err)
+			spqrlog.Zero.Error().Err(err).Msg("error while connecting to postgresql")
 			continue
 		}
 		return db, nil
@@ -42,27 +42,30 @@ func getConn(ctx context.Context, dbname string, retryCnt int) (*sqlx.DB, error)
 var r = rand.New(rand.NewSource(31337))
 
 func simple() {
-	ctx := context.TODO()
 
 	for {
-
-		func () {
+		func() {
 			time.Sleep(time.Duration(50+r.Intn(10)) * time.Microsecond)
 
-			conn, err := getConn(ctx, dbname, 2)
+			conn, err := getConn(dbname, 2)
 			if err != nil {
-				fmt.Printf("stress test FAILED %w", err)
+				spqrlog.Zero.Error().Err(err).Msg("stress test FAILED")
 				panic(err)
 			}
-			defer conn.Close()
+			defer func(conn *sql.DB) {
+				err := conn.Close()
+				if err != nil {
+					spqrlog.Zero.Error().Err(err).Msg("")
+				}
+			}(conn)
 
-			if _, err := conn.Query(fmt.Sprintf("SELECT * FROM %s WHERE i = %d", relation, r.Intn(10))); err != nil {
-				fmt.Printf("stress test FAILED %w", err)
+			if _, err := conn.Query(fmt.Sprintf("SELECT * FROM %s WHERE i = %d", relation, 1+r.Intn(10))); err != nil {
+				spqrlog.Zero.Error().Err(err).Msg("")
 				panic(err)
 			}
 
 			fmt.Printf("SELECT OK\n")
-		} ()
+		}()
 	}
 }
 
@@ -77,12 +80,12 @@ var cmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		wg := &sync.WaitGroup{}
 
-		for i := 0; i < par; i++ {
+		for range par {
 			wg.Add(1)
-			go func(wg * sync.WaitGroup) {
+			go func(wg *sync.WaitGroup) {
 				defer wg.Done()
 				simple()
-			} (wg)
+			}(wg)
 		}
 
 		wg.Wait()
@@ -93,7 +96,6 @@ var cmd = &cobra.Command{
 	SilenceErrors: true,
 }
 
-
 var cmdTest = &cobra.Command{
 	Use:   "test",
 	Short: "SPQR stress test tool",
@@ -102,35 +104,31 @@ var cmdTest = &cobra.Command{
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
 
-
-		ctx, f := context.WithTimeout(context.Background(), 10 * time.Second)
+		ctx, f := context.WithTimeout(context.Background(), 10*time.Second)
 		defer f()
 
 		go simple()
 
-		select {
-		case <-ctx.Done():
-			fmt.Printf("stress test executed OK")
-		}
-
+		<-ctx.Done()
 		return nil
 	},
 	SilenceUsage:  true,
 	SilenceErrors: true,
 }
 
-
 func init() {
 	cmd.PersistentFlags().IntVarP(&par, "parallel", "p", 10, "# of workers")
-	cmd.PersistentFlags().StringVarP(&hostname, "host", "", "spqr_router_1_1", "")
+	cmd.PersistentFlags().StringVarP(&hostname, "host", "", "spqr_router_1", "")
 	cmd.PersistentFlags().StringVarP(&relation, "rel", "r", "x", "")
 	cmd.PersistentFlags().StringVarP(&dbname, "dbname", "d", "dbtpcc", "")
-	cmd.PersistentFlags().StringVarP(&username, "usename", "u", "user1", "")
+	cmd.PersistentFlags().StringVarP(&username, "username", "u", "user1", "")
 	cmd.PersistentFlags().StringVarP(&sslmode, "sslmode", "s", "disable", "")
 
 	cmd.AddCommand(cmdTest)
 }
 
 func main() {
-	cmd.Execute()
+	if err := cmd.Execute(); err != nil {
+		panic(err)
+	}
 }
